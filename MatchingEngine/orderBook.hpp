@@ -8,17 +8,43 @@
 #include <algorithm>
 #include <optional>
 #include <any>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 #include "orderClass.hpp"
 
 using Price = int64_t;
 using Quantity = int64_t;
 using Id = int64_t;
 using orderIterator = std::list<Order>::iterator;
+constexpr int producerBits = 7;
+constexpr int counterBits  = 56;
+constexpr int producerShift = counterBits;
+constexpr int maxProducers = (1 << producerBits);
+
+enum class OpType { Submit, Cancel, Modify};
+
+struct producer{
+int producerId;
+int64_t counter = 0;
+
+Id nextId(){
+    return(static_cast<int64_t>(producerId) << producerShift) | counter++;
+}
+};
+
+int producerOf(Id id){
+    return static_cast<int>(id >> producerShift);
+}
+
 
 struct level{
     std::list<Order> orders;
     //orderIterator iterator;
 };
+
+
 
 class OrderBook{
 private:
@@ -309,8 +335,102 @@ public:
     return true;
    }
 
-
-
-
+struct Request{
+    OpType requestType;
+    Order order;
+    Id id;
+    std::optional<Price> newPrice;
+    std::optional<Quantity> newQuantity;
     
+};
+
+
+struct RingBuffer{
+private:
+    size_t capacity;
+    std::vector<Request> buffer;
+    size_t head = 0;
+    size_t tail = 0;
+    size_t count = 0;
+    std::mutex m;
+    std::condition_variable convar;
+    bool stopping = false;
+   
+
+    bool isFull() const {
+        if(count == capacity) return true;
+        return false;
+    }
+    bool isEmpty() const{
+        if(count == 0) return true;
+        return false;
+    }
+    Request takeRequestLocked(){
+        auto request = buffer[head];
+        head = (head + 1) % capacity;
+        --count;
+        return request;
+    }
+public:
+
+    bool push(const Request& r){
+        std::unique_lock<std::mutex> lock(m);
+        if(isFull()) return false;
+        else{
+            buffer[tail] = r;
+            tail = (tail + 1) % capacity;
+            ++count;
+            convar.notify_one();
+            return true;
+        }
+        
+    }
+    std::optional<Request> pop(){
+        std::unique_lock<std::mutex> lock(m);
+        if(isEmpty()) return std::nullopt;
+        else{
+            return takeRequestLocked();
+        }
+    }
+    std::optional<Request> waitAndPop(){
+        std::unique_lock<std::mutex> lock(m);
+        convar.wait(lock, [this]{ return count > 0 || stopping; });
+        if(stopping && isEmpty()) return std::nullopt;
+        else{
+            return takeRequestLocked();
+        }
+    }
+    void shutdown(){
+        std::unique_lock<std::mutex> lock(m);
+        stopping = true;
+        convar.notify_all();
+    }
+    RingBuffer(size_t capacity)
+    :capacity(capacity),
+    buffer(capacity){}
+
+};
+
+void writerLoop(RingBuffer& queue, OrderBook& book){
+    while(true){
+        auto request = queue.waitAndPop();
+        if(!request) break;
+        else{
+            auto& cRequest = *request;
+            auto& cOrder = cRequest.order;
+            auto& rType = cRequest.requestType;
+            if(rType == OpType::Submit){
+                book.submit(cOrder);
+                std::println("Submitted Order, Id: {}", cOrder.id);
+            }else if(rType == OpType::Modify){
+                book.modify(cRequest.id, cRequest.newPrice, cRequest.newQuantity);
+                std::println("Modified Order ID : {} with price: {} and quantity: {}", cRequest.id, cRequest.newPrice.value_or((-1)), cRequest.newQuantity.value_or(-1));
+            }else{
+                book.cancel(cRequest.id);
+                std::println("Cancel Request Fufilled");
+            }
+        }
+    }
+}
+
 };

@@ -5,8 +5,9 @@
 #include <iostream>
 #include <random>
 #include <chrono>
+#include <cassert>
 
-enum class OpType { Submit, Cancel, Modify};
+//enum class OpType { Submit, Cancel, Modify};
 
 struct LoggedOp{
 
@@ -440,11 +441,135 @@ bool invReplay(std::vector<LoggedOp>& sequence){
     }
 };
 
+OrderBook::Request makeRequest(int64_t id){
+    OrderBook::Request req{};
+    req.id = id;
+    return req;
+}
+void pushMany(OrderBook::RingBuffer& queue, int producerId, int count){
+    producer prod(producerId);
+    
+
+    for(int i = 0; i < count; ++i){
+        auto req = makeRequest(prod.nextId());
+        bool pushed = queue.push(req);
+        assert(pushed);
+    }
+
+}
+
+void testRingBufferConcurrent(){
+ OrderBook::RingBuffer buffer(100000);
+ std::vector<std::thread> threads;
+ for(int i = 0; i < 4; ++i){
+    threads.emplace_back(pushMany, std::ref(buffer), i, 5000);
+ }
+ for(auto& t : threads){
+    t.join();
+ }
+ std::vector<int64_t>lastSeen(4, -1);
+ int total = 0;
+ while(auto item = buffer.pop()){
+    ++total;
+    auto p = producerOf(item->id);
+    assert(p >= 0 && p < 4);
+    assert(item->id > lastSeen[p]);
+    lastSeen[p] = item->id;
+ }
+ assert(total == 4 * 5000);
+
+ std::cout << "[PASS] Test 5: Concurrent Producers\n";
+
+}
+
+
+
+void testRingBufferFillsAndRefuses() {
+    OrderBook::RingBuffer rb(4);
+
+    assert(rb.push(makeRequest(1)) == true);
+    assert(rb.push(makeRequest(2)) == true);
+    assert(rb.push(makeRequest(3)) == true);
+    assert(rb.push(makeRequest(4)) == true);
+
+    assert(rb.push(makeRequest(5)) == false);
+
+    std::cout << "[PASS] Test 1: Fills and Refuses\n";
+}
+
+void testRingBufferFIFOOrder() {
+    OrderBook::RingBuffer rb(4);
+
+    rb.push(makeRequest(101));
+    rb.push(makeRequest(102));
+    rb.push(makeRequest(103));
+    rb.push(makeRequest(104));
+
+    auto r1 = rb.pop();
+    assert(r1.has_value() && r1->id == 101);
+
+    auto r2 = rb.pop();
+    assert(r2.has_value() && r2->id == 102);
+
+    auto r3 = rb.pop();
+    assert(r3.has_value() && r3->id == 103);
+
+    auto r4 = rb.pop();
+    assert(r4.has_value() && r4->id == 104);
+
+    std::cout << "[PASS] Test 2: FIFO Order Out\n";
+}
+
+void testRingBufferDrainsAndRefuses() {
+    OrderBook::RingBuffer rb(4);
+
+    rb.push(makeRequest(1));
+    rb.push(makeRequest(2));
+    rb.push(makeRequest(3));
+    rb.push(makeRequest(4));
+
+    for (int i = 0; i < 4; ++i) {
+        rb.pop();
+    }
+
+    auto extraPop = rb.pop();
+    assert(!extraPop.has_value());
+
+    std::cout << "[PASS] Test 3: Drains and Refuses\n";
+}
+
+void testRingBufferWrapAround() {
+    OrderBook::RingBuffer rb(4);
+
+    for (int64_t i = 1; i <= 12; ++i) {
+        bool pushed = rb.push(makeRequest(i));
+        assert(pushed == true);
+
+        auto popped = rb.pop();
+        assert(popped.has_value());
+        assert(popped->id == i);
+    }
+
+    assert(!rb.pop().has_value());
+
+    std::cout << "[PASS] Test 4: Wrap-Around Test\n";
+}
+
+void runRingBufferTests() {
+    testRingBufferFillsAndRefuses();
+    testRingBufferFIFOOrder();
+    testRingBufferDrainsAndRefuses();
+    testRingBufferWrapAround();
+    testRingBufferConcurrent();
+}
+
+
+
 
 int main(){
     Test t;
 
-    /*std::vector<Order> buyAggressorOrders {
+    std::vector<Order> buyAggressorOrders {
         {Side::Sell, Type::Limit, 102, 100, 1, 0},
         {Side::Sell, Type::Limit, 103, 50, 2, 0},
         {Side::Buy, Type::Limit, 103, 90, 3, 0}
@@ -707,7 +832,7 @@ int main(){
     std::vector<Id> cancelLastAtPriceIds {1};
     std::vector<Id> cancelLastAtPriceExpected {1};
     std::vector<OrderBook::ExpectedLevel> cancelLastAtPriceLevels {};
-    t.CancelTest(cancelLastAtPriceSequence, cancelLastAtPriceIds, cancelLastAtPriceExpected, cancelLastAtPriceLevels);*/
+    t.CancelTest(cancelLastAtPriceSequence, cancelLastAtPriceIds, cancelLastAtPriceExpected, cancelLastAtPriceLevels);
 
     generator gen;
     OrderBook book;
@@ -720,6 +845,23 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
     }
 
+    producer a(1);
+    producer b(2);
+    producer c(3);
+    for(int i = 0; i < 10; ++i){
+        auto aId = a.nextId();
+        auto bId = b.nextId();
+        auto cId = c.nextId();
+        std::println("a Id: {}",aId);
+        std::println("producer id: {}",producerOf(aId));
+        std::println("b Id: {}",bId);
+        std::println("producer id: {}",producerOf(bId));
+        std::println("c Id: {}",cId);
+        std::println("producer id: {}",producerOf(cId));
+        
+    }
+
+    runRingBufferTests();
 
     return 0;
 }
