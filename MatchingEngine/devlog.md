@@ -38,16 +38,113 @@
 | Model derivation + 3 rejects + id scheme (W7·2) | ✅ done | single-writer-with-queue; producer-partitioned ids |
 | Thread reps + deadlock drill (W7·3) | ✅ done | race produced & fixed 2 ways; deadlock produced & fixed 2 ways |
 | Queue design + depth dial (W7·4) | ✅ done | `Request` type, reject-on-full, response path scoped, MODEST dial |
-| MPSC queue + writer loop (W8·1) | ⬜ next | — |
-| Adversarial + determinism tests (W8·2) | ⬜ | — |
+| Producer id packing (1 sign / 7 producer / 56 counter) | ✅ done | round-trip verified across 3 producers |
+| `Request` + `Request → LoggedOp` conversion | ✅ done | exercised by both integration tests |
+| `RingBuffer` (bounded MPSC, mutex + condvar) | ✅ done | 5 tests inc. 4-thread concurrent run, 30 consecutive clean |
+| `writerLoop` (single writer, 2-phase drain) | ✅ done | 2 integration tests — submit, cancel, modify, matching |
+| Fuzz through the queue + determinism check (W8·2) | ⬜ next | — |
 | Concurrency debug/harden (W8·3) | ⬜ | — |
 | Concurrency defence + cold rep (W8·4) | ⬜ | — |
 
-**Status: PHASE 2 COMPLETE · W7 COMPLETE (design) · PHASE 3 IMPLEMENTATION OPENS AT W8·1.** W4 core + W5 (modify, edge cases I, validation) + map unification + W6 (property-based fuzzer, shrinker, defence pass) — 23 hand-written tests, 100k fuzzed operations across 4 invariants with zero violations, a proven shrinker, and a README that defends every structural decision cold. **W7 added the full concurrency specification with zero engine code touched: primitives derived from this engine's own hot path, the single-writer-with-queue model derived and three alternatives rejected on three different grounds, producer-partitioned ids decided, thread and deadlock drills run on throwaways, and the queue element type, overflow policy, response-path scope and depth dial all decided in writing.**
+**Status: PHASE 2 COMPLETE · W7 COMPLETE (design) · PHASE 3 IMPLEMENTATION IN PROGRESS.** W4 core + W5 (modify, edge cases I, validation) + map unification + W6 (property-based fuzzer, shrinker, defence pass) — 23 hand-written tests, 100k fuzzed operations across 4 invariants with zero violations, a proven shrinker, and a README that defends every structural decision cold. **W7 added the full concurrency specification with zero engine code touched: primitives derived from this engine's own hot path, the single-writer-with-queue model derived and three alternatives rejected on three different grounds, producer-partitioned ids decided, thread and deadlock drills run on throwaways, and the queue element type, overflow policy, response-path scope and depth dial all decided in writing. W8·1 shipped the first code since W6: producer-side bit-packed ids, the `Request` type, a bounded mutex+condvar MPSC ring buffer, and the single-writer loop — all outside `OrderBook`, which is byte-identical. Orders now flow producer → queue → writer → book, verified by five ring-buffer tests (including a four-thread concurrent run, thirty consecutive clean) and two integration tests covering submit, cancel, modify and matching through the queue. The 23-test suite, the 100k-operation fuzzer and the shrinker all pass untouched — the regression proof that the matching core was not modified.**
 
 ---
 
 ## Session entries
+### W8·1 — MPSC queue + single-writer loop (COMPLETE)
+
+First session to change the repo since W6. Everything built here is **new code outside the book** — `submit`, `cancel`, `modify` and the match loop are byte-identical, and the full existing suite (23 tests + 100k-op fuzzer + shrinker) passes untouched. That is the gate, and it held.
+
+---
+
+**Producer id construction (the deferred W7·2 bit-packing).** `producer` struct — a `producerId` plus a plain **non-atomic** `int64_t counter`, with `nextId()` packing and post-incrementing. Named constants (`producerBits`, `counterBits`, `producerShift`, `maxProducers`) rather than magic 56s and 255s.
+
+- **Layout: 1 sign bit clear · 7 bits producer · 56 bits counter.** The producer field was cut from 8 bits to 7 for a specific reason: a field of width *w* at shift *s* occupies bits *s* through *s+w−1*, so an 8-bit field at shift 56 reaches **bit 63 — the sign bit**. Shifting into the sign bit of a signed type is UB, and even where it "works" you get a negative id that surprises everything assuming ids are positive. 7 bits keeps the top bit permanently clear and still gives 128 producers, far past any realistic need. (`uint64_t` would recover the bit and allow 256 producers — rejected because `Id` is already `int64_t` throughout `Order`, `cancelIndex`, `validate` and every test, and one unused bit is not worth that churn.)
+- **`static_cast` before the shift, not after.** `producerId` is an `int`; shifting a 32-bit value left by 56 overflows the `int` and is UB *before* the result would ever be widened. Widen first, then shift.
+- **Why OR works, and what it depends on.** The shifted producer is all zeros in the low 56 bits and the counter is all zeros in the high bits, so at every bit position at most one operand has a 1 — the fields **never contend** and OR merges them cleanly. That disjointness is the whole mechanism: exceed the counter's 56 bits and it would bleed into the producer field silently, and producer 3's ids would start decoding as producer 4's. 2^56 ≈ 7×10^16 ids per producer — at 1 M orders/sec, over two thousand years to exhaust. `|` over `+` because for disjoint fields they're identical, but `+` **carries** if the fields ever do overlap (corrupting the high field too) while `|` keeps the damage local — and `|` documents intent: independent fields merged, not numbers summed.
+- **Modular partitioning (`id % N == p`) rejected**, having been considered properly: it is equally collision-free (every integer has exactly one remainder mod N), but **N is baked into every id** — add a fifth producer and every id already issued decodes to the wrong producer, so the scheme isn't stable under growth. Extraction is also integer division (~20–40 cycles) against one shift.
+- **Verified by round-trip:** three producers, ten ids each. Blocks start at 2^56, 2×2^56, 3×2^56 — three disjoint regions — counters increment in the low bits with the high portion untouched, every id decodes to its issuer, nothing negative.
+
+---
+
+**`Request` — the queue element.** Flat tagged struct: `OpType` tag, `Order`, `Id`, `optional<Price>`, `optional<Quantity>`. Aggregate (no constructor), brace-initialised.
+
+- **`id` is a plain `Id`, not an optional** — cancel and modify *always* have one, so optional would mean "may legitimately be absent," which is false, and every use site would unwrap something always present. Contrast `newPrice`/`newQuantity`, where absent genuinely *means* "leave unchanged."
+- **A `variant` was the more principled design and was deliberately traded away.** A variant makes irrelevant fields *unrepresentable*; the flat struct makes it a convention the tag enforces. Accepted cost: cancel and modify carry a meaningless zeroed `Order`, and `Order{}` is used rather than plausible-looking values specifically so it fails loudly if ever read. Documented in a comment, since the type can no longer say it.
+- **`Request → LoggedOp` conversion turned out to be one line.** The two structs are currently field-identical, so the conversion is a straight copy with nothing to dispatch on — a branching version was written, found to be doing nothing, and deleted. **The value was never in the function; it is in the types being separate.** The moment W9 adds a timestamp to `Request` for latency measurement they diverge, and the copy is the price of that independence. Honest state: trivial today, load-bearing later.
+
+---
+
+**`RingBuffer` — bounded MPSC queue, mutex + condvar (the Modest dial).** Fixed-capacity `vector<Request>` allocated once at construction, `head`/`tail`/`count`, one `std::mutex`, one `std::condition_variable`, a `stopping` flag.
+
+- **A class, not a public struct** — `head`, `tail`, `count` and the storage are invariants that must stay consistent, so reaching in from outside would move correctness from the type to every caller. Deliberately the opposite call from `Order` (public struct, pure data, no invariants of its own): same reasoning, different answer.
+- **Full vs empty resolved with a count.** With head and tail alone, empty and full are *both* `head == tail` — identical state, opposite meaning. Options were sacrificing a slot (tail never catches head) or a separate count. Count chosen: it uses every slot and expresses the condvar predicate directly ("is there anything to pop" is a direct read). Accepted cost is a third piece of state that must be updated on every push and pop or it drifts.
+- **Built and proven single-threaded first, mutex added after** — deliberately, so wrap-around arithmetic and concurrency weren't being debugged simultaneously. Four tests: fills-and-refuses, FIFO-order-out, drains-and-refuses, and the wrap test (push/pop twelve times so both indices wrap three times). **The first three pass with completely broken wrap arithmetic** — on a fresh queue you never reach the end of the array — so the wrap test is the only one that proves the modulo.
+- **The mutex wraps the whole method body, not individual lines.** `push` is four steps (check full → write → advance tail → increment count) and the invariant spans all four. Two producers with one slot left would both read not-full, both write to **the same slot** (neither has advanced tail yet), then advance tail twice for one item and double-increment the count — the lost-update race corrupting a data structure rather than a counter. Exactly the atomic-vs-mutex distinction from the W7·3 account drill: an atomic makes one variable's operation indivisible, a mutex makes a region exclusive.
+- **Concurrent test:** four producer threads × 5,000 pushes into an oversized queue, drained on the main thread after joining. Checks total popped equals total pushed, every id decodes to a valid producer, and — the check that actually detects corruption — **each producer's ids come out in ascending order relative to each other**. Global order is meaningless (that's the point), but one thread pushed its own items one at a time, so a torn slot, a skipped slot or a duplicate would break that per-producer sequence. Thirty consecutive runs clean.
+- **Stated honestly: thirty clean runs is evidence, not proof.** What makes this trustworthy is that the reasoning is simple enough to verify by inspection — one lock, taken on every path, held across the whole invariant. The test corroborates; the design convinces. That asymmetry is exactly the W7·4 argument for rejecting lock-free, where the reasoning *isn't* inspectable and the testing can't close the gap.
+
+---
+
+**The condition variable, and the two things it does at once.** `wait(lock, predicate)` puts the thread to sleep **and atomically releases the mutex while it sleeps**, reacquiring on wake. Both halves are essential: without the release, a writer that slept holding the lock would block every producer, so nothing could ever make the queue non-empty and nothing could wake it. That deadlock is why a condvar can't be built from a mutex and a flag.
+
+- **Predicate form, never bare `wait()`** — threads can wake with **no notification at all** (spurious wakeups), so a bare wait means popping an empty queue. The predicate form re-checks on every wake and goes back to sleep if false.
+- **Predicate is `count > 0 || stopping`** — two reasons to stop waiting. Without the `stopping` half, setting the shutdown flag would never wake a sleeping writer and shutdown would hang.
+- **`push` must NOT wait — a real bug, caught and fixed.** An early draft put the same `wait` in `push`, which deadlocks on the very first call: the first producer to arrive at an empty queue evaluates `count > 0 || stopping`, finds both false, and **sleeps waiting for an item only it could have supplied**. Nothing else pushes, so nothing notifies.
+- **The distinction that resolves it — two kinds of waiting.** Producers *do* take the mutex: brief, bounded, nanoseconds, and guaranteed to be released because the holder can't do anything long. What "producers never block" meant in W7·4 is **overflow waiting** — sleeping until a slot frees, which is unbounded. A full queue returns `false` immediately. So the mutex is shared; only the writer ever sleeps on the condvar.
+
+---
+
+**Shutdown — two-phase drain.** `shutdown()` takes the lock, sets `stopping`, and notifies. The writer then keeps processing until the queue is empty and only then exits. `push` refuses once `stopping` is set, so the backlog is finite and the drain terminates.
+
+- **Drain rather than discard, and the argument is the overflow policy's.** Reject-on-full exists so that **acceptance means something** — a producer holding `true` knows its request is in the system. If shutdown discarded accepted requests, `true` would silently stop meaning that, which is precisely the "drop" behaviour rejected as indefensible at W7·4. Draining preserves a clean, statable guarantee: **accepted implies executed.**
+- **"Finish the in-flight action" needs no design** — the writer only checks the flag when it comes back around to `wait`, and a flag cannot preempt a function call, so an in-flight `submit` always completes.
+- **"Keep queued requests" was considered and discarded on inspection** — the ring buffer is *transit*, not storage; there is nowhere to keep them. Persisting across restarts is a durability subsystem (out of scope, same category as the response path).
+- **`notify_all` rather than `notify_one` on shutdown** — with exactly one writer they're equivalent, but `notify_one` would leave a second consumer asleep forever if one ever existed. Cheap insurance on a path that runs once.
+
+---
+
+**Two pops, deliberately, because `nullopt` means two different things.**
+- **`pop()` — non-blocking.** `nullopt` = "nothing right now." Used for draining in tests.
+- **`waitAndPop()` — blocking.** `nullopt` = **"stopping, and nothing left — exit."** Since it sleeps rather than returning when the queue is merely empty, empty-after-wake can only mean shutdown.
+
+Two behaviours deserve two names; one overloaded name is how a caller waits when it meant to poll. The shared four-step take was extracted into a private `takeRequestLocked()` (assumes lock held and non-empty) so the wrap arithmetic exists once.
+
+---
+
+**`writerLoop` — the single writer.** Free function at file scope: `waitAndPop` → `break` on `nullopt` → dispatch on the tag to the **unchanged** `submit`/`cancel`/`modify`. Return values are discarded with a comment, since v1 has no response path.
+
+- **`seq` is NOT stamped here — corrected mid-session.** The plan assumed the writer would assign it at pop time; reading the actual code showed `rest()` already does `o.seq = nextSeq++`, with `OrderBook` owning `nextSeq`. **`rest`'s placement is the better one:** `seq` orders orders *within a level's queue*, and `rest` is exactly the moment an order enters one, so numbers are issued when they're used rather than being burned on market orders that fully fill, cancels, modifies and rejected submits. It is also why `modify`'s reposition works — it routes through `cancel` then `submit` → `rest` and picks up a fresh, later `seq` automatically.
+- **The interview point survives, relocated.** The single definition of arrival order is preserved not because the writer stamps a number, but because **only one thread ever calls `rest`**, so `nextSeq++` — a plain non-atomic increment — is only ever executed by the writer. "How is `seq` assignment thread-safe?" answers: it doesn't need to be.
+
+---
+
+**A layering mistake worth recording.** `Request`, `RingBuffer` and `writerLoop` were all initially written **inside the `OrderBook` class** (hence `OrderBook::Request` in the tests, and a compile error when `std::thread` was handed what turned out to be a non-static member function). Moved to file scope after the class.
+
+The argument is not stylistic: **the book must not know that queues or threads exist.** It is a passive data structure the writer drives from outside, and that separation is what makes "matching logic untouched" true *structurally* rather than by accident. A queue nested inside the book means the book's own definition includes threading machinery. `writerLoop` in particular takes both a `RingBuffer&` and an `OrderBook&` — a member wouldn't need to be handed its own object, which was the giveaway.
+
+---
+
+**Integration tests, and a false pass that only a debug print revealed.** Stage 1 pushed three submits and asserted one level — and passed while proving almost nothing: **all three requests reused `id1`**, because `nextId()` had been called once. Requests two and three were rejected by `validate` as duplicate ids, and the assert on level 100 passed purely because the *first* order rested. Only the printed ids (all identical) exposed it. Same shape as W6's two false-clean fuzz runs: **a passing test is not evidence unless you have confirmed what was actually exercised.**
+
+Fixed by distinct ids per request and asserting *every* level — which is also the argument for the harness, since a helper checking all listed levels by default would have caught it immediately rather than leaving it to a print.
+
+- **`RingBufferIntegration(name, requests, expectedLevels)`** added to the `Test` class: constructs a fresh book and queue, starts the writer, pushes each request, `shutdown()`, `join()`, then compares. **The thread lifecycle is written once**, so the order-dependent part (join producers *before* shutdown; join the writer *before* touching the book) can't be got wrong in a later test.
+- **Id assignment was initially inside the harness and had to move out.** Stamping a fresh id per request works for submits and silently breaks cancel and modify, which need the id of an *existing* order — the harness cannot know which order a cancel targets. The caller owns the ids; the harness pushes what it is given.
+- **`checkStates` rewritten** to build actual `ExpectedLevel`s from the book and compare structurally rather than comparing bare ints.
+- **Stage 2 sequence** exercises every tag and real matching in one run: three resting buys (100/99/98), a **cancel** of the 99 order, a **modify** of the 98 order to quantity 10 (a reduce — keeps position), then a **sell** crossing the 100 level. Expected: 100→40, 99→0, 98→10. Green.
+- **Stated limitation:** `quantityAt` returns 0 for an absent price, so 99→0 proves the quantity went to zero, not that the level was *erased* — a ghost level would pass. Acceptable because cancel's erasure is already proven by the four W4·5 cancel tests with a live-probe order; this test is checking that the *request reached cancel through the queue*, a different layer. Airtight would need `contains(id)`, which would mean exposing the book from the harness.
+- **Fills are not observable through this path at all** — `writerLoop` discards them and there is no response path, so state assertions are the only instrument. A real and expected consequence of the W7·4 scope decision.
+
+---
+
+**Also this session:** capacity constrained to a power of two and `% capacity` replaced with `& (capacity - 1)` — identical results for powers of two (a power of two minus one is a mask of all-ones in exactly the low bits), avoiding integer division on the hot path. Done *after* the tests were green, so a failure would be attributable to the bit trick rather than to the wrapping logic.
+
+**Gate: MET.** Orders flow producer → queue → writer → fills; matching code diff-provably unchanged; 23 tests, 100k fuzz, shrinker and all five ring-buffer tests green.
+
+**Deferred to W8·2:** fuzzing *through* the queue — the existing `Generator` feeding requests rather than executing directly. Note the restructure this forces: single-threaded, the generator executes and checks invariants after every step; behind the queue nothing can inspect the book mid-flight (which is the design working, not a limitation), so invariant checks move to the writer side or become end-of-run. This also unlocks the **determinism check** deferred since W4·4 — capture the request stream the writer consumed, convert via `Request → LoggedOp`, replay single-threaded through a fresh book, assert identical results. Plus **stage 3**: multiple producer threads pushing while the writer consumes, which is the real configuration and the only one not yet exercised (everything so far pushed from `main`, so the queue has never been contended and drained simultaneously).
+
+**Cards harvested:** bit-packing — shifts, masks, `(1<<n)-1`, why OR needs disjoint fields, the signed-shift and widen-before-shift hazards · power-of-two modulo as a mask · condition variables — atomic release-on-wait, predicate form, spurious wakeups · `unique_lock` vs `lock_guard` (why `wait` needs the former) · ring buffer full-vs-empty ambiguity and the two resolutions · aggregate initialisation and why a class with no user-declared constructor takes braces not parens · `std::optional` is not formattable by `std::format`/`println`, and why the library refuses to guess.
 
 ### W7·4 — Queue design + depth dial (COMPLETE — W7 COMPLETE)
 

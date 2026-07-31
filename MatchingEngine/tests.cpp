@@ -18,6 +18,9 @@ struct LoggedOp{
     std::optional<Quantity> newQuantity;
 };
 
+LoggedOp convToOp(Request request){
+        return LoggedOp(request.requestType, request.order, request.id, request.newPrice, request.newQuantity);
+    }
 std::ostream& operator<<(std::ostream& os, const OrderBook::Fill& fill) {
     os << "(" << fill.price << "," << fill.quantity << "," << fill.agressorId << "," << fill.restingId << ")";
     return os;
@@ -62,6 +65,28 @@ struct Test {
             return os;
         }
     };
+
+    bool checkStates(OrderBook& book, std::vector<OrderBook::ExpectedLevel> expectedState){
+        std::vector<OrderBook::ExpectedLevel> actualStates;
+        for (const auto& state : expectedState) {
+            auto it = book.quantityAt(state.side, state.price);
+            actualStates.push_back({state.side,state.price,it});
+        }
+
+        if (expectedState.size() == actualStates.size()) {
+            int i = 0;
+            for (const auto& state : expectedState) {
+                if (actualStates[i].quantity != expectedState[i].quantity) {
+                    return false;
+                }
+                ++i;
+            }
+        } else {
+            return false;
+        }
+
+        return true;
+    }
 
 
 
@@ -279,7 +304,6 @@ struct Test {
         return false;
     }
 
-
     std::optional<std::vector<LoggedOp>> generateAndExecute(OrderBook& book, generator& gen, int iterations){
         std::uniform_int_distribution<int> sideDist(0, 1);
         std::uniform_int_distribution<int> typeDist(0, 9);
@@ -324,8 +348,8 @@ struct Test {
                     
                 }
                 if(operation >= 80 && operation <= 99){
-                    auto Order = book.getOrderInfo(gen.restingIds[indexDist(gen.rng)]);
                     size_t idx = indexDist(gen.rng);
+                    auto Order = book.getOrderInfo(gen.restingIds[idx]);
                     Id idToCancel = gen.restingIds[idx];
                     book.cancel(idToCancel);
                     gen.restingIds.erase(gen.restingIds.begin() + idx);
@@ -367,16 +391,16 @@ struct Test {
 
 
             if(book.checkNoCrossedBook()){
-                return history;
                 std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
+                return history;
             } 
             if(book.checkNoOrphans() != std::nullopt){
-               return history;
-               std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n"; 
+                std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n";
+               return history; 
             } 
             if(!book.checkFIFO()){
-              return history;
-              std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
+            std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
+            return history;
   
             } 
 
@@ -384,44 +408,242 @@ struct Test {
     return std::nullopt;
 
 }
+bool deterTest(const OrderBook& book1,const OrderBook& book2,std::pair<int,int> priceRange){
+    for(int i = priceRange.first; i <= priceRange.second; ++i){
+        auto buySide1 = book1.idsAt(Side::Buy, i);
+        auto sellSide1 = book1.idsAt(Side::Sell, i);
+        auto buySide2 = book2.idsAt(Side::Buy, i);
+        auto sellSide2 = book2.idsAt(Side::Sell, i);
+        if(buySide1 != buySide2){
+            std::println("[FAIL] Side: Buy Price: {} Present Ids: {} Coressponding Ids: {}",i,buySide1, buySide2);
+            return false;
+        } 
+        if(sellSide1 != sellSide2){
+            std::println("[FAIL] Side: Sell Price: {} Present Ids: {} Coressponding Ids: {}", i,sellSide1, sellSide2);
+            return false;
+        } 
+    }
+    std::println("[PASS] No Id Mismatch Found");
+    return true;
+}
+
+struct idWindow{
+    // must be a power of 2
+    static constexpr size_t capacity = 512;
+    std::vector<Id> window = std::vector<Id>(capacity);
+    size_t cursor = 0;
+    size_t fillCount = 0;
+
+
+    void record(Id id){
+        window[cursor] = id;
+        cursor = (cursor + 1) & (capacity - 1);
+        if(fillCount < capacity){
+            ++fillCount;
+        }
+    }
+    std::optional<Id> pick(std::mt19937& rng){
+        if(fillCount == 0) return std::nullopt;
+        std::uniform_int_distribution<size_t>idPicker(0, fillCount - 1);
+        Id chosenId = window[idPicker(rng)];
+
+        return chosenId;
+    }
+};
+
+std::vector<Request> generateRequest(generator& gen, producer& prod, int iterations){
+     std::uniform_int_distribution<int> sideDist(0, 1);
+        std::uniform_int_distribution<int> typeDist(0, 9);
+        std::uniform_int_distribution<int> priceDist(1, 100);
+        std::uniform_int_distribution<int> quantityDist(1, 100);
+        std::uniform_int_distribution<int> operationDist(0, 99);
+        std::uniform_int_distribution<int> PriceChangeChance(0, 5);
+        std::uniform_int_distribution<int> QuantityChangeChance(0, 5);
+        std::vector<Request> requests;
+        idWindow reqWindow;
+        
+        while(requests.size() < static_cast<size_t>(iterations)){
+            if(reqWindow.window.empty()){
+                Order o{
+                    sideDist(gen.rng) == 0 ? Side::Buy : Side::Sell,
+                        typeDist(gen.rng) != 9 ? Type::Limit : Type::Market,
+                        priceDist(gen.rng),
+                        quantityDist(gen.rng),
+                        prod.nextId(),
+                        0
+                };
+                Request r{
+                    OpType::Submit,
+                    o,
+                    o.id,
+                    std::nullopt,
+                    std::nullopt    
+                };
+                reqWindow.record(r.id);
+                requests.push_back(r);
+            } else{
+                auto operation = operationDist(gen.rng);
+                if( operation >= 50 && operation <= 79){
+                    Order o{
+                    sideDist(gen.rng) == 0 ? Side::Buy : Side::Sell,
+                        typeDist(gen.rng) != 9 ? Type::Limit : Type::Market,
+                        priceDist(gen.rng),
+                        quantityDist(gen.rng),
+                        prod.nextId(),
+                        0
+                    };
+                    Request r{
+                        OpType::Submit,
+                        o,
+                        o.id,
+                        std::nullopt,
+                        std::nullopt
+                    };
+                reqWindow.record(r.id);
+                requests.push_back(r);
+                }
+                if(operation >= 80 && operation <= 99){
+                    auto target = reqWindow.pick(gen.rng);
+                    if(!target) continue;
+                    Request r{
+                        OpType::Cancel,
+                        Order{},
+                        *target,
+                        std::nullopt,
+                        std::nullopt
+                    };
+        
+                    requests.push_back(r);
+                }
+                if(operation >= 0 && operation <= 49){
+                auto target = reqWindow.pick(gen.rng);
+                if(!target) continue;
+                std::optional<Price> newPrice;
+                std::optional<Quantity> newQuantity;
+                if(PriceChangeChance(gen.rng) > 1){
+                    newPrice = priceDist(gen.rng);
+                }
+                if(QuantityChangeChance(gen.rng) > 1){
+                    newQuantity = quantityDist(gen.rng);
+                }
+                Request r{
+                    OpType::Modify,
+                    Order{},
+                    *target,
+                    newPrice,
+                    newQuantity
+                };
+                requests.push_back(r);
+            }
+            }
+        }
+        return requests;
+    }
 
 bool invReplay(std::vector<LoggedOp>& sequence){
     OrderBook book;
 
-    for(int i = 0; i < sequence.size(); ++i){
+    for(size_t i = 0; i < sequence.size(); ++i){
         if(sequence[i].type == OpType::Submit){
-            auto result = book.submit(sequence[i].order);
-            if(!result.has_value() && sequence[i].order.type == Type::Limit){
-                //std::cout << "Replay failed at iteration " << i << ": Submit failed for order ID " << sequence[i].order.seq << "\n";
+            Order o = sequence[i].order;
+            Quantity volBefore = book.totalRestingVolume();
+            Quantity incomingQty = sequence[i].order.quantity;
+            Type orderType = sequence[i].order.type;
+
+            auto result = book.submit(o);
+
+            bool rejected = !result.has_value();
+            Quantity tradedQty = 0;
+            if(result.has_value()){
+                for(const auto& fill : *result){
+                    tradedQty += fill.quantity;
+                }
             }
+
+            Quantity volAfter = book.totalRestingVolume();
+
+            if(!volumeConserved(volBefore, volAfter, incomingQty, tradedQty, orderType, rejected)){
+                std::cout << "VOLUME CONSERVATION VIOLATION at iteration " << i << "\n";
+                return false;
+            }
+
         }else if(sequence[i].type == OpType::Cancel){
             bool result = book.cancel(sequence[i].id);
-            if(!result){
-                //std::cout << "Replay failed at iteration " << i << ": Cancel failed for order ID " << sequence[i].order.seq << "\n";
-            }
         }else if(sequence[i].type == OpType::Modify){
             bool result = book.modify(sequence[i].id, sequence[i].newPrice, sequence[i].newQuantity);
-            if(!result){
-               // std::cout << "Replay failed at iteration " << i << ": Modify failed for order ID " << sequence[i].order.seq << "\n";
-            }
         }
-        if(book.checkNoCrossedBook()){
-                return false;
-                std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
-            } 
-            if(book.checkNoOrphans() != std::nullopt){
-               return false;
-               std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n"; 
-            } 
-            if(!book.checkFIFO()){
-              return false;
-              std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
-  
-            } 
-        }
-    return true;
 
+        if(book.checkNoCrossedBook()){
+            std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
+            return false;
+        } 
+        if(book.checkNoOrphans() != std::nullopt){
+            std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n"; 
+            return false;
+        } 
+        if(!book.checkFIFO()){
+            std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
+            return false;
+        } 
     }
+
+    return true;
+}
+
+ OrderBook invReplayBook(std::vector<LoggedOp>& sequence){
+    OrderBook book;
+    int success = 0;
+    int reject = 0;
+
+    std::println("replay cap size: {}",sequence.size());
+
+    for(size_t i = 0; i < sequence.size(); ++i){
+        if(sequence[i].type == OpType::Submit){
+            Order o = sequence[i].order;
+            Quantity volBefore = book.totalRestingVolume();
+            Quantity incomingQty = sequence[i].order.quantity;
+            Type orderType = sequence[i].order.type;
+
+            auto result = book.submit(o);
+
+            bool rejected = !result.has_value();
+            Quantity tradedQty = 0;
+            if(result.has_value()){
+                ++success;
+                for(const auto& fill : *result){
+                    tradedQty += fill.quantity;
+                }
+            }else{
+                ++reject;
+            }
+
+            Quantity volAfter = book.totalRestingVolume();
+
+            if(!volumeConserved(volBefore, volAfter, incomingQty, tradedQty, orderType, rejected)){
+                std::cout << "VOLUME CONSERVATION VIOLATION at iteration " << i << "\n";
+            }
+
+        }else if(sequence[i].type == OpType::Cancel){
+            bool result = book.cancel(sequence[i].id);
+        }else if(sequence[i].type == OpType::Modify){
+            bool result = book.modify(sequence[i].id, sequence[i].newPrice, sequence[i].newQuantity);
+        }
+
+        if(book.checkNoCrossedBook()){
+            std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
+        } 
+        if(book.checkNoOrphans() != std::nullopt){
+            std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n"; 
+        } 
+        if(!book.checkFIFO()){
+            std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
+        } 
+    }
+
+    std::println("success count: {}", success);
+    std::println("reject count: {}", reject);
+    return book;
+}
     std::vector<LoggedOp> shrinker(std::vector<LoggedOp>& seq){
         bool OpsRemoved = true;
         while(OpsRemoved){
@@ -439,14 +661,154 @@ bool invReplay(std::vector<LoggedOp>& sequence){
         }
         return seq;
     }
-};
+void RingBufferIntegration(const std::string& testName,std::vector<Request> requests, std::vector<OrderBook::ExpectedLevel> eStates){
+    OrderBook rbBook;
+    RingBuffer rbT(64);
+    std::thread writer(writerLoop, std::ref(rbT), std::ref(rbBook), nullptr);
+    for(const auto& req : requests){
+        auto push = rbT.push(req);
+        assert(push);
+    }
+    rbT.shutdown();
+    writer.join();
+    
+    if(checkStates(rbBook, eStates)){
+        std::println("[PASS] Ring Buffer Passed States For: {}", testName);
+    }else{
+        std::println("[FAIL] Ring Buffer Failed State Tests For: {} ", testName);
+    }
+}
+static void worker(RingBuffer& queue, int producerId, int count) {
+    producer prod{producerId, 0};
+    Price basePrice = 100 + producerId * 10000;
 
-OrderBook::Request makeRequest(int64_t id){
-    OrderBook::Request req{};
+    for (int i = 0; i < count; ++i) {
+        Id id = prod.nextId();
+        Price price = basePrice + i;
+
+        bool pushed = queue.push({
+            OpType::Submit,
+            {Side::Buy, Type::Limit, price, 1, id, 0},
+            id,
+            std::nullopt,
+            std::nullopt
+        });
+        assert(pushed);
+    }
+}
+
+void testRingBufferConcurrentMatching() {
+    constexpr int numProducers = 4;
+    constexpr int countPerProducer = 2500;
+    constexpr int totalExpectedOrders = numProducers * countPerProducer;
+
+    OrderBook book;
+    RingBuffer queue(totalExpectedOrders + 1000);
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), nullptr);
+
+    std::vector<std::thread> producers;
+    producers.reserve(numProducers);
+    for (int i = 0; i < numProducers; ++i) {
+        producers.emplace_back(worker, std::ref(queue), i, countPerProducer);
+    }
+
+    for (auto& t : producers) {
+        t.join();
+    }
+
+    queue.shutdown();
+
+    writer.join();
+
+    int64_t totalRestingQuantity = 0;
+
+    for (int p = 0; p < numProducers; ++p) {
+        Price basePrice = 100 + static_cast<Price>(p) * 10000;
+        for (int i = 0; i < countPerProducer; ++i) {
+            Price price = basePrice + i;
+            totalRestingQuantity += book.quantityAt(Side::Buy, price);
+        }
+    }
+
+    std::println("[PASS] Total Resting Quantity: {}", totalRestingQuantity);
+    assert(totalRestingQuantity == totalExpectedOrders);
+}
+
+static void pushAll(RingBuffer& queue, const std::vector<Request>& stream){
+    int pushCount = 0;
+    for(int i = 0; i < stream.size(); ++i){
+        bool pushed = queue.push(stream[i]);
+        assert(pushed);
+        ++pushCount;
+    }
+    //std::println("Push Count: {}", pushCount);
+}
+
+WriterContext testConcurrentGen(int producerCount, int opsPerProd){
+    generator cGen;
+    std::vector<std::vector<Request>> streams;
+    size_t capSize = 1;
+    size_t totalOps = (producerCount * opsPerProd);
+
+    for(int i = 0; i < producerCount; ++i){
+        producer prod(i);
+        auto prodReqs = generateRequest(cGen, prod, opsPerProd);
+        streams.push_back(prodReqs);
+    }
+    for(auto s : streams){
+        while(capSize < totalOps){
+            capSize *= 2;
+        }
+    }
+    //std::println("Capacity: {}", capSize);
+    OrderBook conBook;
+    RingBuffer queue(capSize);
+    WriterContext ctx;
+    ctx.captured.reserve(capSize);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx);
+
+    std::vector<std::thread> threads;
+    for(int i = 0; i < producerCount; ++i){
+        threads.emplace_back(pushAll, std::ref(queue), std::ref(streams[i]));
+    }
+    for(auto& t : threads) t.join();
+    queue.shutdown();
+    writer.join();
+
+    std::vector<LoggedOp> replayCap;
+    for(auto op : ctx.captured){
+        auto opTolog = convToOp(op);
+        replayCap.push_back(opTolog);
+    }
+    auto replayedBook = invReplayBook(replayCap);
+    auto test = deterTest(conBook, replayedBook, {1,100});
+    if(!test){
+        std::println("[FAIL] Failed Determinisim Test");
+    }else std::println("[PASS] Passed Determinisim Test");
+
+    //std::println("ctx capture size: {}", ctx.captured.size());
+    if(ctx.invariant.has_value()){
+        std::string invariant;
+        if(ctx.invariant == vio::crossedBook) invariant = "crossed";
+        if(ctx.invariant == vio::fifo) invariant = "fifo";
+        if(ctx.invariant == vio::orphan) invariant = "orphan";
+        if(ctx.invariant == vio::volumeCon) invariant = "volumeCon";
+        auto invIndex = *ctx.invarIndex;
+        //std::println("VIOLATION at: {}", invIndex);
+    }
+    return ctx;
+}
+
+};
+ 
+
+    Request makeRequest(int64_t id){
+    Request req{};
     req.id = id;
     return req;
 }
-void pushMany(OrderBook::RingBuffer& queue, int producerId, int count){
+void pushMany(RingBuffer& queue, int producerId, int count){
     producer prod(producerId);
     
 
@@ -459,7 +821,7 @@ void pushMany(OrderBook::RingBuffer& queue, int producerId, int count){
 }
 
 void testRingBufferConcurrent(){
- OrderBook::RingBuffer buffer(100000);
+ RingBuffer buffer(100000);
  std::vector<std::thread> threads;
  for(int i = 0; i < 4; ++i){
     threads.emplace_back(pushMany, std::ref(buffer), i, 5000);
@@ -485,7 +847,7 @@ void testRingBufferConcurrent(){
 
 
 void testRingBufferFillsAndRefuses() {
-    OrderBook::RingBuffer rb(4);
+    RingBuffer rb(4);
 
     assert(rb.push(makeRequest(1)) == true);
     assert(rb.push(makeRequest(2)) == true);
@@ -498,7 +860,7 @@ void testRingBufferFillsAndRefuses() {
 }
 
 void testRingBufferFIFOOrder() {
-    OrderBook::RingBuffer rb(4);
+    RingBuffer rb(4);
 
     rb.push(makeRequest(101));
     rb.push(makeRequest(102));
@@ -521,7 +883,7 @@ void testRingBufferFIFOOrder() {
 }
 
 void testRingBufferDrainsAndRefuses() {
-    OrderBook::RingBuffer rb(4);
+    RingBuffer rb(4);
 
     rb.push(makeRequest(1));
     rb.push(makeRequest(2));
@@ -539,7 +901,7 @@ void testRingBufferDrainsAndRefuses() {
 }
 
 void testRingBufferWrapAround() {
-    OrderBook::RingBuffer rb(4);
+    RingBuffer rb(4);
 
     for (int64_t i = 1; i <= 12; ++i) {
         bool pushed = rb.push(makeRequest(i));
@@ -555,12 +917,52 @@ void testRingBufferWrapAround() {
     std::cout << "[PASS] Test 4: Wrap-Around Test\n";
 }
 
-void runRingBufferTests() {
-    testRingBufferFillsAndRefuses();
-    testRingBufferFIFOOrder();
-    testRingBufferDrainsAndRefuses();
-    testRingBufferWrapAround();
-    testRingBufferConcurrent();
+void testVolumeConservedPredicate() {
+    std::cout << "Running volumeConserved direct unit tests...\n";
+
+    // Test 1: Rejected, delta 0, traded 0 -> true
+    assert(volumeConserved(100, 100, 50, 0, Type::Limit, true) == true);
+
+    // Test 2: Rejected, delta 50, traded 0 -> false
+    assert(volumeConserved(100, 150, 50, 0, Type::Limit, true) == false);
+
+    // Test 3: Rejected, delta 0, traded 20 -> false
+    assert(volumeConserved(100, 100, 50, 20, Type::Limit, true) == false);
+
+    // Test 4: Limit, incoming 100, traded 0, delta +100 -> true
+    // (volBefore = 0, volAfter = 100)
+    assert(volumeConserved(0, 100, 100, 0, Type::Limit, false) == true);
+
+    // Test 5: Limit, incoming 100, traded 40, delta +20 -> true
+    // Net effect: +100 incoming - 40 resting removed - 40 aggressor filled = +20 delta
+    assert(volumeConserved(1000, 1020, 100, 40, Type::Limit, false) == true);
+
+    // Test 6: Limit, incoming 100, traded 100, delta -200 -> false
+    // Expected delta: 100 - (100 * 2) = -100. Passing -200 should fail.
+    assert(volumeConserved(1000, 800, 100, 100, Type::Limit, false) == false);
+
+    // Test 7: Market, incoming 100, traded 60, delta -60 -> true
+    // Net effect: 60 resting volume consumed, market order does not rest -> delta = -60
+    assert(volumeConserved(1000, 940, 100, 60, Type::Market, false) == true);
+
+    // Test 8: Market, incoming 100, traded 60, delta 0 -> false
+    assert(volumeConserved(1000, 1000, 100, 60, Type::Market, false) == false);
+
+    std::cout << "[PASS] All 8 volumeConserved unit tests PASSED successfully!\n";
+}
+
+void runRingBufferTests(){
+    //testRingBufferConcurrent();
+    //testRingBufferFillsAndRefuses();
+    //testRingBufferFIFOOrder();
+    //testRingBufferDrainsAndRefuses();
+    //testRingBufferWrapAround();
+    //testVolumeConservedPredicate();
+    //testCancelMidMatch();
+    //testProducerOutrunsConsumer();
+    //testRejectOnFullUnderContention();
+
+
 }
 
 
@@ -569,7 +971,7 @@ void runRingBufferTests() {
 int main(){
     Test t;
 
-    std::vector<Order> buyAggressorOrders {
+    /*std::vector<Order> buyAggressorOrders {
         {Side::Sell, Type::Limit, 102, 100, 1, 0},
         {Side::Sell, Type::Limit, 103, 50, 2, 0},
         {Side::Buy, Type::Limit, 103, 90, 3, 0}
@@ -843,25 +1245,55 @@ int main(){
         std::cout << "Shrunk sequence to " << shrunk.size() << " operations.\n";
     } else {
         std::cout << "Fuzzing completed without detecting issues.\n";
-    }
+    }*/
 
-    producer a(1);
-    producer b(2);
-    producer c(3);
-    for(int i = 0; i < 10; ++i){
-        auto aId = a.nextId();
-        auto bId = b.nextId();
-        auto cId = c.nextId();
-        std::println("a Id: {}",aId);
-        std::println("producer id: {}",producerOf(aId));
-        std::println("b Id: {}",bId);
-        std::println("producer id: {}",producerOf(bId));
-        std::println("c Id: {}",cId);
-        std::println("producer id: {}",producerOf(cId));
-        
-    }
+    //t.test_idWindow();
 
+    /*producer rbProd(1);
+    auto id1 = rbProd.nextId();
+    Order order1{Side::Buy, Type::Limit,100, 100, id1, 0};
+    auto id2 = rbProd.nextId();
+    Order order2{Side::Buy, Type::Limit, 99, 50, id2, 0};
+    auto id3 = rbProd.nextId();
+    Order order3{Side::Buy, Type::Limit, 98, 30, id3, 0};
+    auto id4 = rbProd.nextId();
+    Order order4{Side::Sell, Type::Limit, 100, 60, id4, 0};
+    std::vector<Request> rSequence{
+        {OpType::Submit, order1, id1, std::nullopt, std::nullopt},
+        {OpType::Submit, order2, id2, std::nullopt, std::nullopt},
+        {OpType::Submit, order3, id3, std::nullopt, std::nullopt},
+        {OpType::Cancel, Order{}, id2, std::nullopt, std::nullopt},
+        {OpType::Modify, Order{}, id3, std::nullopt, 10},
+        {OpType::Submit, order4, id4, std::nullopt, std::nullopt}
+    };
+    std::vector<OrderBook::ExpectedLevel> eStates{
+        {Side::Buy, 100, 40},
+        {Side::Buy, 99, 0},
+        {Side::Buy, 98, 10}
+    };
+    t.RingBufferIntegration("RingBuff Test", rSequence, eStates);
     runRingBufferTests();
+    t.testRingBufferConcurrentMatching();*/
 
-    return 0;
+    //runRingBufferTests();
+    //runAdversarialTests();
+
+    auto fuzz = t.testConcurrentGen(3, 33000);
+    if(fuzz.invariant.has_value()){
+        
+        std::vector<LoggedOp> convedOps;
+        for(auto reqs : fuzz.captured){
+           convedOps.push_back(convToOp(reqs));
+           
+        }
+        std::cout << "Fuzzing detected an issue, attempting to shrink the sequence...\n";
+        auto shrunk = t.shrinker(convedOps);
+        auto replay = t.invReplay(convedOps);
+        std::cout << "Shrunk sequence to " << shrunk.size() << " operations.\n";
+    } else {
+        std::cout << "Fuzzing completed without detecting issues.\n";
+
+    }
+ 
+        return 0;
 }

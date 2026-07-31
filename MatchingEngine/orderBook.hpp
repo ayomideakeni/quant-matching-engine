@@ -12,6 +12,8 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <unordered_set>
+#include <utility>
 #include "orderClass.hpp"
 
 using Price = int64_t;
@@ -56,6 +58,13 @@ private:
 public:
 
     std::map<Price, level>& getMap(Side side){
+        if(side == Side::Buy){
+            return bids;
+        }else{
+            return asks;
+        }
+    }
+    const std::map<Price, level>& getMap(Side side) const{
         if(side == Side::Buy){
             return bids;
         }else{
@@ -144,6 +153,37 @@ public:
             
     
     };
+    Quantity totalBidVolume() const {
+        Quantity volume = 0;
+        for (const auto& [price, lvl] : bids) {
+            for (const auto& order : lvl.orders) {
+                volume += order.quantity;
+            }
+        }
+        return volume;
+    }
+
+    Quantity totalAskVolume() const {
+        Quantity volume = 0;
+        for (const auto& [price, lvl] : asks) {
+            for (const auto& order : lvl.orders) {
+                volume += order.quantity;
+            }
+        }
+        return volume;
+    }
+
+    Quantity totalRestingVolume() const {
+        return totalBidVolume() + totalAskVolume();
+    }
+
+    Quantity totalCancelIndexVolume() const {
+        Quantity volume = 0;
+        for (const auto& [id, orderIt] : cancelIndex) {
+            volume += orderIt->quantity;
+        }
+        return volume;
+    }
     
  
     std::optional<std::vector<Fill>> submit(Order& incoming){
@@ -334,6 +374,21 @@ public:
 
     return true;
    }
+   
+std::vector<Id> idsAt(Side s, Price p) const{
+    std::vector<Id> ids;
+    auto& map = getMap(s);
+    auto priceLevel = map.find(p);
+    if(priceLevel != map.end()){
+        for(auto o : priceLevel->second.orders){
+        ids.push_back(o.id);
+    }
+    }
+    
+    return ids;
+}
+
+};
 
 struct Request{
     OpType requestType;
@@ -341,8 +396,9 @@ struct Request{
     Id id;
     std::optional<Price> newPrice;
     std::optional<Quantity> newQuantity;
-    
 };
+
+ 
 
 
 struct RingBuffer{
@@ -411,26 +467,99 @@ public:
 
 };
 
-void writerLoop(RingBuffer& queue, OrderBook& book){
+enum class vio{
+    crossedBook,
+    orphan,
+    fifo,
+    volumeCon
+};
+
+struct WriterContext{
+    std::vector<Request> captured;
+    std::optional<vio> invariant;
+    std::optional<size_t> invarIndex;
+    std::optional<std::vector<Order>> offendingOrders;
+};
+
+bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected){
+    if(rejected){
+        return ((volAfter - volBefore) == 0 && tradedQty == 0);
+    }else if(orderType == Type::Limit){
+        return (((volAfter - volBefore) == incomingQuantity - (tradedQty*2)));
+    }else{
+        return (((volAfter - volBefore) == -tradedQty));
+    }
+}
+
+void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr){
     while(true){
         auto request = queue.waitAndPop();
         if(!request) break;
         else{
             auto& cRequest = *request;
+            //std::println("Popped Request ID: {}", cRequest.id);
+            if(ctx && !ctx->invariant){
+                ctx->captured.push_back(cRequest);
+            }
             auto& cOrder = cRequest.order;
             auto& rType = cRequest.requestType;
             if(rType == OpType::Submit){
-                book.submit(cOrder);
-                std::println("Submitted Order, Id: {}", cOrder.id);
+                if(ctx){
+                auto volPreSub = book.totalRestingVolume();
+                auto cOrderQuantity = cOrder.quantity;
+                auto cOrderType = cOrder.type;
+                auto fills = book.submit(cOrder);
+                auto volPostSub = book.totalRestingVolume();
+                int64_t tradeQuantity = 0;
+                if(fills.has_value()){
+                    for(const auto& fill :*fills){
+                        tradeQuantity += fill.quantity;
+                    }
+                    if(!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, false))){
+                        ctx->invariant = vio::volumeCon;
+                        ctx->invarIndex = ctx->captured.size() - 1;
+                    }
+                }else{
+                    if(!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, true))){
+                        ctx->invariant = vio::volumeCon;
+                        ctx->invarIndex = ctx->captured.size() - 1;
+                        
+                    }
+                }
+                }else{
+                    book.submit(cOrder);
+
+                }
+                //std::println("Submitted Order ID: {}", cOrder.id);
             }else if(rType == OpType::Modify){
                 book.modify(cRequest.id, cRequest.newPrice, cRequest.newQuantity);
-                std::println("Modified Order ID : {} with price: {} and quantity: {}", cRequest.id, cRequest.newPrice.value_or((-1)), cRequest.newQuantity.value_or(-1));
+                //std::println("Modified Order ID : {} with price: {} and quantity: {}", cRequest.id, cRequest.newPrice.value_or((-1)), cRequest.newQuantity.value_or(-1));
             }else{
                 book.cancel(cRequest.id);
-                std::println("Cancel Request Fufilled");
+                //std::println("Cancel Request Fufilled");
             }
+            if(ctx && !ctx->invariant){
+                if(book.checkNoCrossedBook()){
+                ctx->invariant = vio::crossedBook;
+                ctx->invarIndex = ctx->captured.size() - 1;
+                
+            } 
+            if(book.checkNoOrphans() != std::nullopt){
+               ctx->invariant = vio::orphan;
+               ctx->invarIndex = ctx->captured.size() - 1;
+            
+            } 
+            if(!book.checkFIFO()){
+                ctx->invariant = vio::fifo;
+                ctx->invarIndex = ctx->captured.size() - 1;
+            
+            } 
+            }
+            
         }
     }
+
 }
 
-};
+
+
