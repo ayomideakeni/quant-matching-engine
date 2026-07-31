@@ -405,10 +405,10 @@ struct RingBuffer{
 private:
     size_t capacity;
     std::vector<Request> buffer;
-    size_t head = 0;
-    size_t tail = 0;
+    alignas(64) std::atomic<size_t> head{0};
+    alignas(64) std::atomic<size_t> tail{0};
     size_t count = 0;
-    std::mutex m;
+    alignas(64) std::mutex m;
     std::condition_variable convar;
     bool stopping = false;
    
@@ -436,7 +436,7 @@ public:
             buffer[tail] = r;
             tail = (tail + 1) % capacity;
             ++count;
-            convar.notify_one();
+            convar.notify_all();
             return true;
         }
         
@@ -479,6 +479,7 @@ struct WriterContext{
     std::optional<vio> invariant;
     std::optional<size_t> invarIndex;
     std::optional<std::vector<Order>> offendingOrders;
+    std::atomic<size_t> processed{0};
 };
 
 bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected){
@@ -492,6 +493,7 @@ bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQua
 }
 
 void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr){
+
     while(true){
         auto request = queue.waitAndPop();
         if(!request) break;
@@ -500,6 +502,7 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
             //std::println("Popped Request ID: {}", cRequest.id);
             if(ctx && !ctx->invariant){
                 ctx->captured.push_back(cRequest);
+                ctx->processed.fetch_add(1, std::memory_order_release);
             }
             auto& cOrder = cRequest.order;
             auto& rType = cRequest.requestType;

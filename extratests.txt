@@ -1,0 +1,119 @@
+struct ProducerResult { size_t accepted = 0; size_t rejected = 0; };
+
+void backpressureWorker(RingBuffer& queue, int producerId,
+                        int opsCount, ProducerResult& out) {
+    producer prod(producerId);
+    Price basePrice = 1000 + (producerId * 1000);
+
+    for (int i = 0; i < opsCount; ++i) {
+        Order o{Side::Buy, Type::Limit, basePrice + (i % 10), 10, prod.nextId(), 0};
+        Request r{OpType::Submit, o, o.id, std::nullopt, std::nullopt};
+        if (queue.push(r)) ++out.accepted;      // no retry — rejection is the point
+        else               ++out.rejected;
+    }
+}
+
+void testRejectOnFullUnderContention() {
+    constexpr int    producerCount  = 4;
+    constexpr int    opsPerProducer = 50000;
+    constexpr size_t attempted      = size_t(producerCount) * opsPerProducer;
+    constexpr size_t queueCapacity  = 32;       // deliberately far too small
+
+    OrderBook book;
+    RingBuffer queue(queueCapacity);
+    WriterContext ctx;
+    ctx.captured.reserve(attempted);
+
+    std::vector<ProducerResult> results(producerCount);   // distinct elements: no data race
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+
+    std::vector<std::thread> producers;
+    producers.reserve(producerCount);
+    for (int i = 0; i < producerCount; ++i)
+        producers.emplace_back(backpressureWorker, std::ref(queue), i, opsPerProducer, std::ref(results[i]));
+
+    for (auto& p : producers) p.join();
+    queue.shutdown();
+    writer.join();
+
+    size_t accepted = 0, rejected = 0;
+    for (const auto& r : results) { accepted += r.accepted; rejected += r.rejected; }
+
+    // The property under test — two-sided.
+    assert(accepted + rejected == attempted && "Request vanished: neither accepted nor rejected");
+    assert(ctx.captured.size() == accepted  && "accepted-implies-executed violated");
+
+    // Test validity: zero rejections means this run proved nothing.
+    assert(rejected > 0 && "Queue never saturated — reduce queueCapacity");
+
+    assert(!book.checkNoCrossedBook() && "Crossed book under saturation");
+    assert(!book.checkNoOrphans()     && "Orphaned cancelIndex entry");
+    assert(book.checkFIFO()           && "FIFO violated under saturation");
+    assert(book.totalRestingVolume() == static_cast<Quantity>(accepted) * 10
+           && "Volume conservation failed");
+
+    std::println("[PASS] Adversarial Test 2: reject-on-full accepted={} rejected={} ({:.1f}% dropped)",
+                 accepted, rejected, 100.0 * double(rejected) / double(attempted));
+}
+
+void retryingWorker(RingBuffer& queue, int producerId,
+                    int opsCount, size_t& retriesOut) {
+    producer prod(producerId);
+    Price basePrice = 1000 + (producerId * 1000);
+    size_t retries = 0;
+
+    for (int i = 0; i < opsCount; ++i) {
+        Order o{Side::Buy, Type::Limit, basePrice + (i % 10), 10, prod.nextId(), 0};
+        Request r{OpType::Submit, o, o.id, std::nullopt, std::nullopt};
+
+        size_t spins = 0;
+        while (!queue.push(r)) {                 // absorb backpressure rather than drop
+            ++retries;
+            if (++spins >= 64) {                 // spin briefly before paying for a syscall
+                spins = 0;
+                std::this_thread::yield();
+            }
+        }
+    }
+    retriesOut = retries;
+}
+
+void testProducerOutrunsConsumer() {
+    constexpr int    producerCount  = 4;
+    constexpr int    opsPerProducer = 5000;
+    constexpr size_t totalOps       = size_t(producerCount) * opsPerProducer;
+    constexpr size_t queueCapacity  = 512;
+
+    OrderBook book;
+    RingBuffer queue(queueCapacity);
+    WriterContext ctx;
+    ctx.captured.reserve(totalOps);
+
+    std::vector<size_t> retries(producerCount, 0);
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+
+    std::vector<std::thread> producers;
+    producers.reserve(producerCount);
+    for (int i = 0; i < producerCount; ++i)
+        producers.emplace_back(retryingWorker, std::ref(queue), i, opsPerProducer, std::ref(retries[i]));
+
+    for (auto& p : producers) p.join();   // A: no more pushes possible
+    queue.shutdown();                     // B: signal drain-then-exit
+    writer.join();                        // C: writer has finished
+
+    size_t totalRetries = 0;
+    for (size_t r : retries) totalRetries += r;
+
+    assert(ctx.captured.size() == totalOps && "Operation lost under sustained backpressure");
+    assert(totalRetries > 0 && "Writer kept up — contention never occurred, test is vacuous");
+
+    assert(!book.checkNoCrossedBook() && "Crossed book after high contention");
+    assert(!book.checkNoOrphans()     && "Orphan entries in cancelIndex");
+    assert(book.checkFIFO()           && "FIFO broken under high producer contention");
+    assert(book.totalRestingVolume() == static_cast<Quantity>(totalOps) * 10
+           && "Volume conservation check failed");
+
+    std::println("[PASS] Adversarial Test 3: producer-outruns-consumer (retries absorbed: {})", totalRetries);
+}

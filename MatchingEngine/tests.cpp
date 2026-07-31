@@ -654,7 +654,7 @@ bool invReplay(std::vector<LoggedOp>& sequence){
                 if(invReplay(seq)){
                     seq.insert(seq.begin() + i, removed);
                 }else{
-                    std::cout << "Removed operation at index " << i << " (ID: " << removed.order.id << ")\n";
+                    std::cout << "Removed operation at index " << i << " (ID: " << removed.id << ")\n";
                     OpsRemoved = true;
                 }
             }
@@ -745,7 +745,7 @@ static void pushAll(RingBuffer& queue, const std::vector<Request>& stream){
     //std::println("Push Count: {}", pushCount);
 }
 
-WriterContext testConcurrentGen(int producerCount, int opsPerProd){
+void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     generator cGen;
     std::vector<std::vector<Request>> streams;
     size_t capSize = 1;
@@ -761,10 +761,11 @@ WriterContext testConcurrentGen(int producerCount, int opsPerProd){
             capSize *= 2;
         }
     }
-    //std::println("Capacity: {}", capSize);
+    std::println("Capacity: {}", capSize);
     OrderBook conBook;
+    auto totalResting = conBook.totalRestingVolume();
+    std::println("Resting already: {}", totalResting);
     RingBuffer queue(capSize);
-    WriterContext ctx;
     ctx.captured.reserve(capSize);
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx);
 
@@ -787,7 +788,7 @@ WriterContext testConcurrentGen(int producerCount, int opsPerProd){
         std::println("[FAIL] Failed Determinisim Test");
     }else std::println("[PASS] Passed Determinisim Test");
 
-    //std::println("ctx capture size: {}", ctx.captured.size());
+    std::println("ctx capture size: {}", ctx.captured.size());
     if(ctx.invariant.has_value()){
         std::string invariant;
         if(ctx.invariant == vio::crossedBook) invariant = "crossed";
@@ -795,13 +796,186 @@ WriterContext testConcurrentGen(int producerCount, int opsPerProd){
         if(ctx.invariant == vio::orphan) invariant = "orphan";
         if(ctx.invariant == vio::volumeCon) invariant = "volumeCon";
         auto invIndex = *ctx.invarIndex;
-        //std::println("VIOLATION at: {}", invIndex);
+        std::println("VIOLATION at: {}", invIndex);
     }
-    return ctx;
+    return;
 }
 
 };
- 
+
+
+ void testCancelMidMatch() {
+    constexpr int iterations = 500;
+    size_t cancelWon = 0, aggressorWon = 0;
+
+    for (int it = 0; it < iterations; ++it) {
+        OrderBook book;
+        RingBuffer queue(1024);
+        WriterContext ctx;
+        ctx.captured.reserve(8);
+
+        std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+
+        Order resting{Side::Buy, Type::Limit, 100, 50, 1001, 0};
+        bool pushed = queue.push(Request{OpType::Submit, resting, 1001, std::nullopt, std::nullopt});
+        assert(pushed);
+
+        // Synchronise on the writer's counter, NOT by reading the book.
+        while (ctx.processed.load(std::memory_order_acquire) < 1) {
+            std::this_thread::yield();
+        }
+
+        Order aggressor{Side::Sell, Type::Limit, 100, 50, 1002, 0};
+        Request reqAggressor{OpType::Submit, aggressor, 1002, std::nullopt, std::nullopt};
+        Request reqCancel   {OpType::Cancel, Order{},   1001, std::nullopt, std::nullopt};
+
+        std::atomic<bool> go{false};
+        std::thread t1([&]{ while (!go.load(std::memory_order_acquire)) {} queue.push(reqAggressor); });
+        std::thread t2([&]{ while (!go.load(std::memory_order_acquire)) {} queue.push(reqCancel);    });
+        go.store(true, std::memory_order_release);   // start gate: both threads already live
+
+        t1.join();
+        t2.join();
+        queue.shutdown();
+        writer.join();                               // join establishes happens-before on the book
+
+        assert(!book.checkNoCrossedBook() && "Crossed book after cancel-mid-match");
+        assert(!book.checkNoOrphans()     && "Orphaned cancelIndex entry");
+        assert(book.checkFIFO()           && "FIFO violated");
+        assert(ctx.captured.size() == 3   && "Request lost or duplicated");
+
+        Quantity restingSell = book.quantityAt(Side::Sell, 100);
+        Quantity restingBuy  = book.quantityAt(Side::Buy,  100);
+
+        bool cancelFirst    = (restingSell == 50 && restingBuy == 0);  // cancel landed, aggressor rested
+        bool aggressorFirst = (restingSell == 0  && restingBuy == 0);  // full cross, cancel no-opped
+
+        assert((cancelFirst != aggressorFirst) && "Book in a state no interleaving can produce");
+        cancelFirst ? ++cancelWon : ++aggressorWon;
+    }
+
+    std::println("[PASS] Adversarial Test 1: cancel-mid-match ({} cancel-first, {} aggressor-first)",
+                 cancelWon, aggressorWon);
+}
+    struct ProducerResult { size_t accepted = 0; size_t rejected = 0; };
+
+void backpressureWorker(RingBuffer& queue, int producerId,
+                        int opsCount, ProducerResult& out) {
+    producer prod(producerId);
+    Price basePrice = 1000 + (producerId * 1000);
+
+    for (int i = 0; i < opsCount; ++i) {
+        Order o{Side::Buy, Type::Limit, basePrice + (i % 10), 10, prod.nextId(), 0};
+        Request r{OpType::Submit, o, o.id, std::nullopt, std::nullopt};
+        if (queue.push(r)) ++out.accepted;      // no retry — rejection is the point
+        else               ++out.rejected;
+    }
+}
+
+void testRejectOnFullUnderContention() {
+    constexpr int    producerCount  = 4;
+    constexpr int    opsPerProducer = 50000;
+    constexpr size_t attempted      = size_t(producerCount) * opsPerProducer;
+    constexpr size_t queueCapacity  = 32;       // deliberately far too small
+
+    OrderBook book;
+    RingBuffer queue(queueCapacity);
+    WriterContext ctx;
+    ctx.captured.reserve(attempted);
+
+    std::vector<ProducerResult> results(producerCount);   // distinct elements: no data race
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+
+    std::vector<std::thread> producers;
+    producers.reserve(producerCount);
+    for (int i = 0; i < producerCount; ++i)
+        producers.emplace_back(backpressureWorker, std::ref(queue), i, opsPerProducer, std::ref(results[i]));
+
+    for (auto& p : producers) p.join();
+    queue.shutdown();
+    writer.join();
+
+    size_t accepted = 0, rejected = 0;
+    for (const auto& r : results) { accepted += r.accepted; rejected += r.rejected; }
+
+    // The property under test — two-sided.
+    assert(accepted + rejected == attempted && "Request vanished: neither accepted nor rejected");
+    assert(ctx.captured.size() == accepted  && "accepted-implies-executed violated");
+
+    // Test validity: zero rejections means this run proved nothing.
+    assert(rejected > 0 && "Queue never saturated — reduce queueCapacity");
+
+    assert(!book.checkNoCrossedBook() && "Crossed book under saturation");
+    assert(!book.checkNoOrphans()     && "Orphaned cancelIndex entry");
+    assert(book.checkFIFO()           && "FIFO violated under saturation");
+    assert(book.totalRestingVolume() == static_cast<Quantity>(accepted) * 10
+           && "Volume conservation failed");
+
+    std::println("[PASS] Adversarial Test 2: reject-on-full accepted={} rejected={} ({:.1f}% dropped)",
+                 accepted, rejected, 100.0 * double(rejected) / double(attempted));
+}
+
+void retryingWorker(RingBuffer& queue, int producerId,
+                    int opsCount, size_t& retriesOut) {
+    producer prod(producerId);
+    Price basePrice = 1000 + (producerId * 1000);
+    size_t retries = 0;
+
+    for (int i = 0; i < opsCount; ++i) {
+        Order o{Side::Buy, Type::Limit, basePrice + (i % 10), 10, prod.nextId(), 0};
+        Request r{OpType::Submit, o, o.id, std::nullopt, std::nullopt};
+
+        size_t spins = 0;
+        while (!queue.push(r)) {                 // absorb backpressure rather than drop
+            ++retries;
+            if (++spins >= 64) {                 // spin briefly before paying for a syscall
+                spins = 0;
+                std::this_thread::yield();
+            }
+        }
+    }
+    retriesOut = retries;
+}
+
+void testProducerOutrunsConsumer() {
+    constexpr int    producerCount  = 4;
+    constexpr int    opsPerProducer = 5000;
+    constexpr size_t totalOps       = size_t(producerCount) * opsPerProducer;
+    constexpr size_t queueCapacity  = 512;
+
+    OrderBook book;
+    RingBuffer queue(queueCapacity);
+    WriterContext ctx;
+    ctx.captured.reserve(totalOps);
+
+    std::vector<size_t> retries(producerCount, 0);
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+
+    std::vector<std::thread> producers;
+    producers.reserve(producerCount);
+    for (int i = 0; i < producerCount; ++i)
+        producers.emplace_back(retryingWorker, std::ref(queue), i, opsPerProducer, std::ref(retries[i]));
+
+    for (auto& p : producers) p.join();   // A: no more pushes possible
+    queue.shutdown();                     // B: signal drain-then-exit
+    writer.join();                        // C: writer has finished
+
+    size_t totalRetries = 0;
+    for (size_t r : retries) totalRetries += r;
+
+    assert(ctx.captured.size() == totalOps && "Operation lost under sustained backpressure");
+    assert(totalRetries > 0 && "Writer kept up — contention never occurred, test is vacuous");
+
+    assert(!book.checkNoCrossedBook() && "Crossed book after high contention");
+    assert(!book.checkNoOrphans()     && "Orphan entries in cancelIndex");
+    assert(book.checkFIFO()           && "FIFO broken under high producer contention");
+    assert(book.totalRestingVolume() == static_cast<Quantity>(totalOps) * 10
+           && "Volume conservation check failed");
+
+    std::println("[PASS] Adversarial Test 3: producer-outruns-consumer (retries absorbed: {})", totalRetries);
+}
 
     Request makeRequest(int64_t id){
     Request req{};
@@ -952,15 +1126,15 @@ void testVolumeConservedPredicate() {
 }
 
 void runRingBufferTests(){
-    //testRingBufferConcurrent();
-    //testRingBufferFillsAndRefuses();
-    //testRingBufferFIFOOrder();
-    //testRingBufferDrainsAndRefuses();
-    //testRingBufferWrapAround();
-    //testVolumeConservedPredicate();
-    //testCancelMidMatch();
-    //testProducerOutrunsConsumer();
-    //testRejectOnFullUnderContention();
+    testRingBufferConcurrent();
+    testRingBufferFillsAndRefuses();
+    testRingBufferFIFOOrder();
+    testRingBufferDrainsAndRefuses();
+    testRingBufferWrapAround();
+    testVolumeConservedPredicate();
+    testCancelMidMatch();
+    testProducerOutrunsConsumer();
+    testRejectOnFullUnderContention();
 
 
 }
@@ -971,7 +1145,7 @@ void runRingBufferTests(){
 int main(){
     Test t;
 
-    /*std::vector<Order> buyAggressorOrders {
+    std::vector<Order> buyAggressorOrders {
         {Side::Sell, Type::Limit, 102, 100, 1, 0},
         {Side::Sell, Type::Limit, 103, 50, 2, 0},
         {Side::Buy, Type::Limit, 103, 90, 3, 0}
@@ -1236,7 +1410,7 @@ int main(){
     std::vector<OrderBook::ExpectedLevel> cancelLastAtPriceLevels {};
     t.CancelTest(cancelLastAtPriceSequence, cancelLastAtPriceIds, cancelLastAtPriceExpected, cancelLastAtPriceLevels);
 
-    generator gen;
+   /*generator gen;
     OrderBook book;
     auto fuzz = t.generateAndExecute(book, gen, 400000);
     if(fuzz.has_value()){
@@ -1247,42 +1421,18 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
     }*/
 
-    //t.test_idWindow();
-
-    /*producer rbProd(1);
-    auto id1 = rbProd.nextId();
-    Order order1{Side::Buy, Type::Limit,100, 100, id1, 0};
-    auto id2 = rbProd.nextId();
-    Order order2{Side::Buy, Type::Limit, 99, 50, id2, 0};
-    auto id3 = rbProd.nextId();
-    Order order3{Side::Buy, Type::Limit, 98, 30, id3, 0};
-    auto id4 = rbProd.nextId();
-    Order order4{Side::Sell, Type::Limit, 100, 60, id4, 0};
-    std::vector<Request> rSequence{
-        {OpType::Submit, order1, id1, std::nullopt, std::nullopt},
-        {OpType::Submit, order2, id2, std::nullopt, std::nullopt},
-        {OpType::Submit, order3, id3, std::nullopt, std::nullopt},
-        {OpType::Cancel, Order{}, id2, std::nullopt, std::nullopt},
-        {OpType::Modify, Order{}, id3, std::nullopt, 10},
-        {OpType::Submit, order4, id4, std::nullopt, std::nullopt}
-    };
-    std::vector<OrderBook::ExpectedLevel> eStates{
-        {Side::Buy, 100, 40},
-        {Side::Buy, 99, 0},
-        {Side::Buy, 98, 10}
-    };
-    t.RingBufferIntegration("RingBuff Test", rSequence, eStates);
-    runRingBufferTests();
-    t.testRingBufferConcurrentMatching();*/
+    //t.RingBufferIntegration("RingBuff Test", rSequence, eStates);
+   // runRingBufferTests();
+    //t.testRingBufferConcurrentMatching();
 
     //runRingBufferTests();
-    //runAdversarialTests();
 
-    auto fuzz = t.testConcurrentGen(3, 33000);
-    if(fuzz.invariant.has_value()){
+    WriterContext ctx;
+    t.testConcurrentGen(16, 25000, ctx);
+    if(ctx.invariant.has_value()){
         
         std::vector<LoggedOp> convedOps;
-        for(auto reqs : fuzz.captured){
+        for(auto reqs : ctx.captured){
            convedOps.push_back(convToOp(reqs));
            
         }
