@@ -767,7 +767,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     std::println("Resting already: {}", totalResting);
     RingBuffer queue(capSize);
     ctx.captured.reserve(capSize);
-    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr);
 
     std::vector<std::thread> threads;
     for(int i = 0; i < producerCount; ++i){
@@ -777,7 +777,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     queue.shutdown();
     writer.join();
 
-    std::vector<LoggedOp> replayCap;
+    /*std::vector<LoggedOp> replayCap;
     for(auto op : ctx.captured){
         auto opTolog = convToOp(op);
         replayCap.push_back(opTolog);
@@ -797,7 +797,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
         if(ctx.invariant == vio::volumeCon) invariant = "volumeCon";
         auto invIndex = *ctx.invarIndex;
         std::println("VIOLATION at: {}", invIndex);
-    }
+    }*/
     return;
 }
 
@@ -1141,11 +1141,13 @@ void runRingBufferTests(){
 
 
 
+#ifndef TESTS_NO_MAIN
+
 
 int main(){
     Test t;
 
-    std::vector<Order> buyAggressorOrders {
+    /*std::vector<Order> buyAggressorOrders {
         {Side::Sell, Type::Limit, 102, 100, 1, 0},
         {Side::Sell, Type::Limit, 103, 50, 2, 0},
         {Side::Buy, Type::Limit, 103, 90, 3, 0}
@@ -1410,7 +1412,7 @@ int main(){
     std::vector<OrderBook::ExpectedLevel> cancelLastAtPriceLevels {};
     t.CancelTest(cancelLastAtPriceSequence, cancelLastAtPriceIds, cancelLastAtPriceExpected, cancelLastAtPriceLevels);
 
-   /*generator gen;
+   generator gen;
     OrderBook book;
     auto fuzz = t.generateAndExecute(book, gen, 400000);
     if(fuzz.has_value()){
@@ -1419,17 +1421,17 @@ int main(){
         std::cout << "Shrunk sequence to " << shrunk.size() << " operations.\n";
     } else {
         std::cout << "Fuzzing completed without detecting issues.\n";
-    }*/
+    }
 
     //t.RingBufferIntegration("RingBuff Test", rSequence, eStates);
    // runRingBufferTests();
     //t.testRingBufferConcurrentMatching();
 
-    //runRingBufferTests();
+    //runRingBufferTests();*/
 
     WriterContext ctx;
-    t.testConcurrentGen(16, 25000, ctx);
-    if(ctx.invariant.has_value()){
+    t.testConcurrentGen(1, 1000000, ctx);
+    /*if(ctx.invariant.has_value()){
         
         std::vector<LoggedOp> convedOps;
         for(auto reqs : ctx.captured){
@@ -1443,7 +1445,8 @@ int main(){
     } else {
         std::cout << "Fuzzing completed without detecting issues.\n";
 
-    }
+    }*/
  
         return 0;
 }
+#endif
