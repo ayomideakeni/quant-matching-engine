@@ -8,6 +8,43 @@
 #include <cassert>
 
 //enum class OpType { Submit, Cancel, Modify};
+struct Stats {
+    double mean = 0.0, p50 = 0.0, p99 = 0.0, p999 = 0.0, max = 0.0;
+    size_t n = 0;
+};
+
+Stats computeStats(std::vector<double>& samples) {
+    Stats st;
+    if (samples.empty()) return st;
+
+    std::sort(samples.begin(), samples.end());
+    const size_t n = samples.size();
+
+    st.n    = n;
+    st.p50  = samples[n * 50 / 100];
+    st.p99  = samples[n * 99 / 100];
+    st.p999 = samples[n * 999 / 1000];
+    st.max  = samples.back();
+
+    double sum = 0.0;
+    for (double s : samples) sum += s;
+    st.mean = sum / static_cast<double>(n);
+    return st;
+}
+
+// Kept for single-benchmark runs; the sweep uses the table printer instead.
+void reportPercentiles(const std::string& label, std::vector<double>& samples) {
+    Stats st = computeStats(samples);
+    if (st.n == 0) return;
+    std::cout << "-----------------------------------------------------\n";
+    std::cout << label << " (Samples: " << st.n << " batches)\n";
+    std::cout << "  Mean  : " << st.mean << " ns/op\n";
+    std::cout << "  p50   : " << st.p50  << " ns/op\n";
+    std::cout << "  p99   : " << st.p99  << " ns/op\n";
+    std::cout << "  p99.9 : " << st.p999 << " ns/op\n";
+    std::cout << "  Max   : " << st.max  << " ns/op\n";
+    std::cout << "-----------------------------------------------------\n";
+}
 
 struct LoggedOp{
 
@@ -590,8 +627,8 @@ bool invReplay(std::vector<LoggedOp>& sequence){
     return true;
 }
 
- OrderBook invReplayBook(std::vector<LoggedOp>& sequence){
-    OrderBook book;
+ OrderBook& invReplayBook(OrderBook& book,std::vector<LoggedOp>& sequence){
+    
     int success = 0;
     int reject = 0;
 
@@ -664,7 +701,7 @@ bool invReplay(std::vector<LoggedOp>& sequence){
 void RingBufferIntegration(const std::string& testName,std::vector<Request> requests, std::vector<OrderBook::ExpectedLevel> eStates){
     OrderBook rbBook;
     RingBuffer rbT(64);
-    std::thread writer(writerLoop, std::ref(rbT), std::ref(rbBook), nullptr);
+    std::thread writer(writerLoop, std::ref(rbT), std::ref(rbBook), nullptr, nullptr);
     for(const auto& req : requests){
         auto push = rbT.push(req);
         assert(push);
@@ -705,7 +742,7 @@ void testRingBufferConcurrentMatching() {
     OrderBook book;
     RingBuffer queue(totalExpectedOrders + 1000);
 
-    std::thread writer(writerLoop, std::ref(queue), std::ref(book), nullptr);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), nullptr, nullptr);
 
     std::vector<std::thread> producers;
     producers.reserve(numProducers);
@@ -767,7 +804,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     std::println("Resting already: {}", totalResting);
     RingBuffer queue(capSize);
     ctx.captured.reserve(capSize);
-    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx, nullptr);
 
     std::vector<std::thread> threads;
     for(int i = 0; i < producerCount; ++i){
@@ -777,12 +814,13 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     queue.shutdown();
     writer.join();
 
-    /*std::vector<LoggedOp> replayCap;
+    std::vector<LoggedOp> replayCap;
     for(auto op : ctx.captured){
         auto opTolog = convToOp(op);
         replayCap.push_back(opTolog);
     }
-    auto replayedBook = invReplayBook(replayCap);
+    OrderBook rBook;
+    auto& replayedBook = invReplayBook(rBook,replayCap);
     auto test = deterTest(conBook, replayedBook, {1,100});
     if(!test){
         std::println("[FAIL] Failed Determinisim Test");
@@ -797,11 +835,171 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
         if(ctx.invariant == vio::volumeCon) invariant = "volumeCon";
         auto invIndex = *ctx.invarIndex;
         std::println("VIOLATION at: {}", invIndex);
-    }*/
+    }
     return;
 }
 
+
+void concurrentBench(int producerCount, int opsPerProd, int draincap){
+    generator cGen;
+    std::vector<std::vector<Request>> streams;
+    size_t totalOps = (producerCount * opsPerProd);
+    BenchContext btx;
+    btx.drainCap = draincap;
+    btx.samples.reserve(totalOps / draincap + 16);
+    size_t buffSize = 1;
+
+
+    for(int i = 0; i < producerCount; ++i){
+        producer prod(i);
+        auto prodReqs = generateRequest(cGen, prod, opsPerProd);
+       streams.push_back(std::move(prodReqs));
+    }
+    
+        while(buffSize < totalOps){
+            buffSize *= 2;
+        }
+    
+    
+    OrderBook conBook;
+    RingBuffer queue(buffSize);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
+
+    std::vector<std::thread> threads;
+    for(int i = 0; i < producerCount; ++i){
+        threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]));
+    }
+    for(auto& t : threads) t.join();
+    queue.shutdown();
+    writer.join();
+
+    reportPercentiles("Bench Percentiles",btx.samples);
+
+  
+    return;
+}
+void testPoolAllocateN() {
+    constexpr size_t N = 100;
+    memoryPool pool(N);
+    std::unordered_set<Order*> allocatedPtrs;
+
+    for (size_t i = 0; i < N; ++i) {
+        Order* ptr = pool.allocate();
+        assert(ptr != nullptr && "Allocation within capacity should not return null");
+        assert(allocatedPtrs.insert(ptr).second && "Allocated pointers must be unique");
+    }
+
+    std::cout << "[PASS] Test 1: Allocate N - all distinct\n";
+}
+
+void testPoolAllocateNPlusOne() {
+    constexpr size_t N = 50;
+    memoryPool pool(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        Order* ptr = pool.allocate();
+        assert(ptr != nullptr);
+    }
+
+    Order* overflowPtr = pool.allocate();
+    assert(overflowPtr == nullptr && "Allocation beyond capacity must return nullptr");
+
+    std::cout << "[PASS] Test 2: Allocate N+1 - overflow returns null\n";
+}
+
+void testPoolDeallocateOneAllocate() {
+    constexpr size_t N = 10;
+    memoryPool pool(N);
+
+    std::vector<Order*> ptrs;
+    for (size_t i = 0; i < N; ++i) {
+        ptrs.push_back(pool.allocate());
+    }
+
+    // Free one item
+    Order* freedPtr = ptrs[4];
+    pool.deallocate(freedPtr);
+
+    // Re-allocate
+    Order* reallocatedPtr = pool.allocate();
+    assert(reallocatedPtr != nullptr && "Re-allocation after deallocate should succeed");
+    assert(reallocatedPtr == freedPtr && "Recycled pointer should match the recently freed block");
+
+    std::cout << "[PASS] Test 3: Deallocate one, allocate - successfully reused\n";
+}
+
+void testPoolAllocateAllFreeAllAllocateAll() {
+    constexpr size_t N = 64;
+    memoryPool pool(N);
+
+    std::vector<Order*> firstRound;
+    for (size_t i = 0; i < N; ++i) {
+        Order* ptr = pool.allocate();
+        assert(ptr != nullptr);
+        firstRound.push_back(ptr);
+    }
+
+    assert(pool.allocate() == nullptr && "Pool should be exhausted");
+
+    // Free everything
+    for (Order* ptr : firstRound) {
+        pool.deallocate(ptr);
+    }
+
+    // Allocate N again to verify full recovery
+    std::unordered_set<Order*> secondRound;
+    for (size_t i = 0; i < N; ++i) {
+        Order* ptr = pool.allocate();
+        assert(ptr != nullptr && "Free list should be fully recovered");
+        assert(secondRound.insert(ptr).second && "Second round allocations must be distinct");
+    }
+
+    assert(pool.allocate() == nullptr && "Pool should be exhausted again");
+
+    std::cout << "[PASS] Test 4: Allocate all, free all, allocate all - free list fully recovers\n";
+}
+
+void testPoolInterleavedAllocateFree() {
+    constexpr size_t N = 20;
+    memoryPool pool(N);
+
+    std::unordered_set<Order*> livePtrs;
+    std::vector<Order*> history;
+
+    // Fixed sequence of allocate/free steps
+    for (int step = 0; step < 500; ++step) {
+        // Pseudo-random decision based on current count and step modulo
+        bool doAllocate = (livePtrs.size() < N) && (step % 3 != 0 || livePtrs.empty());
+
+        if (doAllocate) {
+            Order* ptr = pool.allocate();
+            assert(ptr != nullptr);
+            // Invariant: returned pointer must NOT already be active in livePtrs
+            assert(livePtrs.find(ptr) == livePtrs.end() && "Pointer handed out was already live!");
+            livePtrs.insert(ptr);
+            history.push_back(ptr);
+        } else {
+            Order* ptrToFree = *livePtrs.begin();
+            livePtrs.erase(livePtrs.begin());
+            pool.deallocate(ptrToFree);
+        }
+    }
+
+    std::cout << "[PASS] Test 5: Interleaved allocate/free - zero double-allocations while live\n";
+}
+
+void runmemoryPoolTests() {
+    testPoolAllocateN();
+    testPoolAllocateNPlusOne();
+    testPoolDeallocateOneAllocate();
+    testPoolAllocateAllFreeAllAllocateAll();
+    testPoolInterleavedAllocateFree();
+}
+
+
 };
+
+
 
 
  void testCancelMidMatch() {
@@ -814,7 +1012,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
         WriterContext ctx;
         ctx.captured.reserve(8);
 
-        std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+        std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx, nullptr);
 
         Order resting{Side::Buy, Type::Limit, 100, 50, 1001, 0};
         bool pushed = queue.push(Request{OpType::Submit, resting, 1001, std::nullopt, std::nullopt});
@@ -885,7 +1083,7 @@ void testRejectOnFullUnderContention() {
 
     std::vector<ProducerResult> results(producerCount);   // distinct elements: no data race
 
-    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx, nullptr);
 
     std::vector<std::thread> producers;
     producers.reserve(producerCount);
@@ -951,7 +1149,7 @@ void testProducerOutrunsConsumer() {
 
     std::vector<size_t> retries(producerCount, 0);
 
-    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx);
+    std::thread writer(writerLoop, std::ref(queue), std::ref(book), &ctx, nullptr);
 
     std::vector<std::thread> producers;
     producers.reserve(producerCount);
@@ -1423,15 +1621,13 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
     }
 
-    //t.RingBufferIntegration("RingBuff Test", rSequence, eStates);
-   // runRingBufferTests();
-    //t.testRingBufferConcurrentMatching();
-
-    //runRingBufferTests();*/
+    runRingBufferTests();
+    t.testRingBufferConcurrentMatching();
 
     WriterContext ctx;
     t.testConcurrentGen(1, 1000000, ctx);
-    /*if(ctx.invariant.has_value()){
+    
+    if(ctx.invariant.has_value()){
         
         std::vector<LoggedOp> convedOps;
         for(auto reqs : ctx.captured){
@@ -1446,6 +1642,16 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
 
     }*/
+
+    for (int i = 0; i < 20; ++i) {
+        generator gen;
+        OrderBook book;
+       t.concurrentBench(16, 200000, 10);
+       //t.generateAndExecute(book, gen, 400000);
+    }
+   
+
+    //t.runmemoryPoolTests();
  
         return 0;
 }

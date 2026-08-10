@@ -736,3 +736,278 @@ int main(int argc, char** argv) {
 
     return 0;
 }*/
+
+struct Slot {
+    std::atomic<size_t> seq;
+    Request req;
+
+    Slot() : seq(0), req() {}
+};
+
+class RingBuffer {
+private:
+    const size_t capacity;
+    const size_t mask;
+    std::vector<Slot> buffer;
+
+    // Separate head and tail across L1 cache lines to eliminate false sharing
+    alignas(64) std::atomic<size_t> head{0};
+    alignas(64) std::atomic<size_t> tail{0};
+    alignas(64) std::atomic<bool> stopping{false};
+
+public:
+    explicit RingBuffer(size_t cap) 
+        : capacity(cap), mask(cap - 1), buffer(cap) 
+    {
+        // Enforce power-of-two capacity for fast bitwise masking
+        assert((cap & (cap - 1)) == 0 && "Capacity must be a power of 2");
+
+        // Initialization: slot i starts with seq = i
+        for (size_t i = 0; i < capacity; ++i) {
+            buffer[i].seq.store(i, std::memory_order_relaxed);
+        }
+    }
+
+    // Lock-Free Multi-Producer Push
+    bool push(const Request& r) {
+        size_t pos = tail.load(std::memory_order_relaxed);
+
+        while (true) {
+            Slot& slot = buffer[pos & mask];
+            size_t seq = slot.seq.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+
+            if (diff == 0) {
+                // Slot is free and it's our turn: try to claim it
+                if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                    // Won CAS! Write data into slot
+                    slot.req = r;
+                    // Publish slot for consumer: seq = pos + 1
+                    slot.seq.store(pos + 1, std::memory_order_release);
+                    return true;
+                }
+                // Lost CAS to another producer: loop around with updated pos
+            } else if (diff < 0) {
+                // Slot holds unread data from a prior lap: queue is full
+                return false;
+            } else {
+                // Another producer advanced tail past pos: reload tail and retry
+                pos = tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // Lock-Free Single-Consumer Drain Batch
+    size_t waitAndDrain(std::vector<Request>& out, size_t maxItems) {
+        out.clear();
+        size_t drained = 0;
+        size_t pos = head.load(std::memory_order_relaxed);
+
+        while (drained < maxItems) {
+            Slot& slot = buffer[pos & mask];
+            size_t seq = slot.seq.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+
+            if (diff == 0) {
+                // Item published and ready for consumption
+                out.push_back(slot.req);
+                // Mark slot writable for next lap: seq = pos + capacity
+                slot.seq.store(pos + capacity, std::memory_order_release);
+                pos++;
+                drained++;
+            } else {
+                // Nothing available at head
+                break;
+            }
+        }
+
+        if (drained > 0) {
+            head.store(pos, std::memory_order_relaxed);
+        }
+
+        return drained;
+    }
+
+    void shutdown() {
+        stopping.store(true, std::memory_order_release);
+    }
+
+    bool isStopping() const {
+        return stopping.load(std::memory_order_acquire);
+    }
+
+    bool isEmpty()  {
+        size_t pos = head.load(std::memory_order_relaxed);
+        Slot& slot = buffer[pos & mask];
+        size_t seq = slot.seq.load(std::memory_order_acquire);
+        return (static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1)) != 0;
+    }
+};
+
+enum class vio {
+    crossedBook,
+    orphan,
+    fifo,
+    volumeCon
+};
+
+struct WriterContext {
+    std::vector<Request> captured;
+    std::optional<vio> invariant;
+    std::optional<size_t> invarIndex;
+    std::optional<std::vector<Order>> offendingOrders;
+    std::atomic<size_t> processed{0};
+};
+
+struct BenchContext {
+    std::vector<double> samples;
+    std::vector<double> lockAcquireNs; // Time spent blocked attempting to acquire std::mutex (per batch)
+    std::vector<double> totalBatchNs;  // Total time including lock acquisition + drain + processing (per op)
+    std::vector<bool> didSleep;
+    size_t drainCap = 64;
+};
+
+bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected) {
+    if (rejected) {
+        return ((volAfter - volBefore) == 0 && tradedQty == 0);
+    } else if (orderType == Type::Limit) {
+        return (((volAfter - volBefore) == incomingQuantity - (tradedQty * 2)));
+    } else {
+        return (((volAfter - volBefore) == -tradedQty));
+    }
+}
+
+void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr, BenchContext* btx = nullptr) {
+    std::vector<Request> drained;
+    drained.reserve(btx ? btx->drainCap : 64);
+
+    auto processOne = [&](Request& cRequest) -> void {
+        if (ctx && !ctx->invariant) {
+            ctx->captured.push_back(cRequest);
+            ctx->processed.fetch_add(1, std::memory_order_release);
+        }
+        auto& cOrder = cRequest.order;
+        auto& rType = cRequest.requestType;
+
+        if (rType == OpType::Submit) {
+            if (ctx) {
+                auto volPreSub = book.totalRestingVolume();
+                auto cOrderQuantity = cOrder.quantity;
+                auto cOrderType = cOrder.type;
+                auto fills = book.submit(cOrder);
+                auto volPostSub = book.totalRestingVolume();
+                int64_t tradeQuantity = 0;
+                if (fills.has_value()) {
+                    for (const auto& fill : *fills) tradeQuantity += fill.quantity;
+                    if (!volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, false)) {
+                        ctx->invariant = vio::volumeCon;
+                        ctx->invarIndex = ctx->captured.size() - 1;
+                    }
+                } else {
+                    if (!volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, true)) {
+                        ctx->invariant = vio::volumeCon;
+                        ctx->invarIndex = ctx->captured.size() - 1;
+                    }
+                }
+            } else {
+                book.submit(cOrder);
+            }
+        } else if (rType == OpType::Modify) {
+            book.modify(cRequest.id, cRequest.newPrice, cRequest.newQuantity);
+        } else {
+            book.cancel(cRequest.id);
+        }
+
+        if (ctx && !ctx->invariant) {
+            if (book.checkNoCrossedBook()) {
+                ctx->invariant = vio::crossedBook;
+                ctx->invarIndex = ctx->captured.size() - 1;
+            }
+            if (book.checkNoOrphans() != std::nullopt) {
+                ctx->invariant = vio::orphan;
+                ctx->invarIndex = ctx->captured.size() - 1;
+            }
+            if (!book.checkFIFO()) {
+                ctx->invariant = vio::fifo;
+                ctx->invarIndex = ctx->captured.size() - 1;
+            }
+        }
+    };
+
+    size_t spinCount = 0;
+
+    while (true) {
+        auto start = std::chrono::steady_clock::now();
+        size_t cap = btx ? btx->drainCap : 64;
+
+        size_t n = queue.waitAndDrain(drained, cap);
+
+        if (n > 0) {
+            auto end = std::chrono::steady_clock::now();
+            
+            // Record timing metrics ONLY when items were actually processed
+            if (btx) {
+                auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                btx->samples.push_back(static_cast<double>(ns) / static_cast<double>(n));
+                btx->didSleep.push_back(false); // Lock-free queue never blocks on condvar
+            }
+
+            for (auto& r : drained) {
+                processOne(r);
+            }
+
+            spinCount = 0; // Reset backoff spin counter
+        } else {
+            // Queue is empty: check if shutdown was requested and queue is completely drained
+            if (queue.isStopping() && queue.isEmpty()) {
+                break; // Exit cleanly
+            }
+
+            // Bounded backoff spin strategy
+            if (++spinCount > 100) {
+                std::this_thread::yield();
+            }
+        }
+    }
+}
+
+void concurrentBench(int producerCount, int opsPerProd, int draincap) {
+    generator cGen;
+    std::vector<std::vector<Request>> streams;
+    size_t totalOps = static_cast<size_t>(producerCount) * opsPerProd;
+
+    BenchContext btx;
+    btx.drainCap = draincap;
+    size_t estSamples = totalOps / draincap + 16;
+    btx.samples.reserve(estSamples);
+    btx.didSleep.reserve(estSamples);
+
+    // Power of 2 ring buffer capacity sizing
+    size_t buffSize = 1024;
+    while (buffSize < totalOps) {
+        buffSize *= 2;
+    }
+
+    for (int i = 0; i < producerCount; ++i) {
+        producer prod(i);
+        auto prodReqs = generateRequest(cGen, prod, opsPerProd);
+        streams.push_back(std::move(prodReqs));
+    }
+
+    OrderBook conBook;
+    RingBuffer queue(buffSize);
+
+    std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < producerCount; ++i) {
+        threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]));
+    }
+
+    for (auto& t : threads) t.join();
+
+    queue.shutdown();
+    writer.join();
+
+    reportPercentiles("Lock-Free MPSC Latency (ns/op)", btx.samples);
+}

@@ -20,6 +20,77 @@ using Price = int64_t;
 using Quantity = int64_t;
 using Id = int64_t;
 using orderIterator = std::list<Order>::iterator;
+
+size_t spinCount = 750;
+
+struct memoryPool{
+    std::vector<Order> slots;
+    Order* freeHead = nullptr;
+
+    Order* allocate(){
+        if(!freeHead){
+            return nullptr;
+        }
+        Order* temp = freeHead;
+        freeHead = temp->next;
+        temp->next = nullptr;
+        temp->prev = nullptr;
+
+        return temp;
+    }
+
+    void deallocate(Order* o){
+        o->next = freeHead;
+        freeHead = o;
+    }
+
+    memoryPool(size_t n)
+    : slots(std::vector<Order>(n)) 
+    {
+        for(size_t i = n; i-- > 0;){
+            deallocate(&slots[i]);
+        }
+    }
+    // never resize after construction
+
+    memoryPool(const memoryPool&) = delete;
+    
+
+ 
+};
+
+struct LevelIterator{
+    Order* current;
+
+    Order& operator*(){
+        return *current;
+    }
+
+    LevelIterator& operator++(){
+        current = current->next;
+        return *this;
+    }
+
+    bool operator!=(const LevelIterator& other) const{
+        return current != other.current;
+    }
+};
+struct ConstLevelIterator{
+    const Order* current;
+
+    const Order& operator*() {
+        return *current;
+    }
+
+    ConstLevelIterator& operator++(){
+        current = current->next;
+        return *this;
+    }
+
+    bool operator!=(const ConstLevelIterator& other) const{
+        return current != other.current;
+    }
+};
 constexpr int producerBits = 7;
 constexpr int counterBits  = 56;
 constexpr int producerShift = counterBits;
@@ -42,20 +113,60 @@ int producerOf(Id id){
 
 
 struct level{
-    std::list<Order> orders;
-    //orderIterator iterator;
+    Order* head;
+    Order* tail;
+
+    LevelIterator begin(){return {head};}
+    LevelIterator end(){return {nullptr};}
+
+    ConstLevelIterator begin() const{ return {head};}
+    ConstLevelIterator end() const {return {nullptr};}
+
+    void unlink(Order* o){
+       if(o->prev){
+        o->prev->next = o->next;
+       }else{
+        head = o->next;
+       }
+
+       if(o->next){
+        o->next->prev = o->prev;
+       }else{
+        tail = o->prev;
+       }
+
+       o->prev = nullptr;
+       o->next = nullptr;
+    }
+    void linkBack(Order* o){
+        if(!tail){
+            head = o;
+            tail = o;
+        }else{
+            auto oldTail = tail;
+            oldTail->next = o;
+            o->prev = oldTail;
+            tail = o;
+
+        }
+    }
 };
 
 
 
 class OrderBook{
 private:
+    memoryPool pool;
     std::map<Price, level> asks;
     std::map<Price, level> bids;
-    std::unordered_map<Id,orderIterator> cancelIndex;
+    std::unordered_map<Id,Order*> cancelIndex;
     int64_t nextSeq = 0;
 
+    
+
 public:
+
+    OrderBook(size_t poolSize = 100000): pool(poolSize) {}
 
     std::map<Price, level>& getMap(Side side){
         if(side == Side::Buy){
@@ -83,7 +194,7 @@ public:
     std::optional<Order> getOrderInfo(Id id) const{
         auto it = cancelIndex.find(id);
         if (it == cancelIndex.end()) return std::nullopt;
-        orderIterator orderIt = it->second;
+        auto orderIt = it->second;
         return Order{orderIt->side, orderIt->type, orderIt->price, orderIt->quantity, id, orderIt->seq};
     }
 
@@ -100,18 +211,18 @@ public:
 
    Order* best(Side s) {
         if (s == Side::Buy) {
-            if (!bids.empty()) return &bids.rbegin()->second.orders.front();
+            if (!bids.empty()) return bids.rbegin()->second.head;
         } else {
-            if (!asks.empty()) return &asks.begin()->second.orders.front();
+            if (!asks.empty()) return asks.begin()->second.head;
         }
         return nullptr;
     }
 
    const Order* best(Side s) const {
         if (s == Side::Buy) {
-            if (!bids.empty()) return &bids.rbegin()->second.orders.front();
+            if (!bids.empty()) return bids.rbegin()->second.head;
         } else {
-            if (!asks.empty()) return &asks.begin()->second.orders.front();
+            if (!asks.empty()) return asks.begin()->second.head;
         }
         return nullptr;
     }
@@ -120,21 +231,24 @@ public:
         return cancelIndex.find(id) != cancelIndex.end();
     }
 
-    template <typename BookSide>
-        orderIterator restInto(BookSide& book, Order& o){
-            auto& lst = book[o.price].orders;
-            return lst.insert(lst.end(), o);
+    
+        void restInto(std::map<Price, level>& map, Order* o){
+            map[o->price].linkBack(o);
     }
 
     
     bool rest(Order& o){
         if(!(validate(o))) return false;
-            o.seq = nextSeq++;
-        orderIterator it;
-        if (o.side == Side::Buy) it = restInto(bids, o);
-        else                     it = restInto(asks, o);
+        Order* slot = pool.allocate();
+        if(slot == nullptr) return false;
+        *slot = o;
+        slot->next = nullptr;
+        slot->prev = nullptr;
+            slot->seq = nextSeq++;
+        if (o.side == Side::Buy) restInto(bids, slot);
+        else                     restInto(asks, slot);
 
-        cancelIndex[o.id] = it;
+        cancelIndex[slot->id] = slot;
         
         return true;
     }
@@ -156,7 +270,7 @@ public:
     Quantity totalBidVolume() const {
         Quantity volume = 0;
         for (const auto& [price, lvl] : bids) {
-            for (const auto& order : lvl.orders) {
+            for (const auto& order : lvl) {
                 volume += order.quantity;
             }
         }
@@ -166,7 +280,7 @@ public:
     Quantity totalAskVolume() const {
         Quantity volume = 0;
         for (const auto& [price, lvl] : asks) {
-            for (const auto& order : lvl.orders) {
+            for (const auto& order : lvl) {
                 volume += order.quantity;
             }
         }
@@ -236,7 +350,7 @@ public:
         int64_t levelQty = 0;
         if(side == Side::Buy){
             if(bids.find(price) != bids.end()){
-             auto const& priceLevel = bids.at(price).orders;
+             auto const& priceLevel = bids.at(price);
              for(const auto& i : priceLevel){
                 levelQty += i.quantity;
              }
@@ -244,7 +358,7 @@ public:
             return levelQty;
         }else{
             if(asks.find(price) != asks.end()){
-                auto const& priceLevel = asks.at(price).orders;
+                auto const& priceLevel = asks.at(price);
                 for(auto const& i : priceLevel){
                     levelQty += i.quantity;
                 }
@@ -256,16 +370,18 @@ public:
      bool cancel(Id id){
         auto it = cancelIndex.find(id);
         if(it == cancelIndex.end()) return false;
-        orderIterator orderIt = it->second;
-        const Price p = orderIt-> price;
-        const Order& order = *orderIt;
+        auto o = it->second;
+        const Price p = o->price;
+        const Side s = o->side;
         
-        auto& map = getMap(order.side);
+        auto& map = getMap(s);
+        auto levelIt = map.find(p);
 
-           if(map.find(order.price) != map.end()) {
-            map.at(order.price).orders.erase(orderIt);
-                if(map.at(p).orders.empty()){
-                    map.erase(p);
+           if(levelIt != map.end()) {
+            levelIt->second.unlink(o);
+            pool.deallocate(o);
+                if(levelIt->second.head == nullptr){
+                   map.erase(levelIt);
                 }
            }
             
@@ -283,7 +399,7 @@ public:
             cancel(id);
             return true;
         } 
-        orderIterator orderIt = it->second;
+        auto orderIt = it->second;
         Order& order = *orderIt;
         Price currentPrice = orderIt->price;
         Quantity currentQuantity = orderIt->quantity;
@@ -354,7 +470,7 @@ public:
    bool checkFIFO() const{
     for(const auto& [price, level] : bids){
         int64_t lastSeq = -1;
-        for(const auto& order : level.orders){
+        for(const auto& order : level){
             if(lastSeq != -1 && order.seq < lastSeq){
                 return false;
             }
@@ -364,7 +480,7 @@ public:
 
     for(const auto& [price, level] : asks){
         int64_t lastSeq = -1;
-        for(const auto& order : level.orders){
+        for(const auto& order : level){
             if(lastSeq != -1 && order.seq < lastSeq){
                 return false;
             }
@@ -380,7 +496,7 @@ std::vector<Id> idsAt(Side s, Price p) const{
     auto& map = getMap(s);
     auto priceLevel = map.find(p);
     if(priceLevel != map.end()){
-        for(auto o : priceLevel->second.orders){
+        for(auto o : priceLevel->second){
         ids.push_back(o.id);
     }
     }
@@ -400,28 +516,26 @@ struct Request{
 
  
 
-
-struct RingBuffer{
+struct RingBuffer {
 private:
     size_t capacity;
     std::vector<Request> buffer;
     alignas(64) std::atomic<size_t> head{0};
     alignas(64) std::atomic<size_t> tail{0};
-    size_t count = 0;
+    std::atomic<size_t> count = 0;
     alignas(64) std::mutex m;
     std::condition_variable convar;
     bool stopping = false;
-   
 
     bool isFull() const {
-        if(count == capacity) return true;
+        if (count == capacity) return true;
         return false;
     }
-    bool isEmpty() const{
-        if(count == 0) return true;
+    bool isEmpty() const {
+        if (count == 0) return true;
         return false;
     }
-    Request takeRequestLocked(){
+    Request takeRequestLocked() {
         auto request = buffer[head];
         head = (head + 1) % capacity;
         --count;
@@ -429,52 +543,84 @@ private:
     }
 public:
 
-    bool push(const Request& r){
+    bool push(const Request& r) {
         std::unique_lock<std::mutex> lock(m);
-        if(isFull()) return false;
-        else{
+        if (isFull()) return false;
+        else {
             buffer[tail] = r;
             tail = (tail + 1) % capacity;
             ++count;
             convar.notify_all();
             return true;
         }
-        
     }
-    std::optional<Request> pop(){
+
+    std::optional<Request> pop() {
         std::unique_lock<std::mutex> lock(m);
-        if(isEmpty()) return std::nullopt;
-        else{
+        if (isEmpty()) return std::nullopt;
+        else {
             return takeRequestLocked();
         }
     }
-    std::optional<Request> waitAndPop(){
+
+    std::optional<Request> waitAndPop() {
         std::unique_lock<std::mutex> lock(m);
         convar.wait(lock, [this]{ return count > 0 || stopping; });
-        if(stopping && isEmpty()) return std::nullopt;
-        else{
+        if (stopping && isEmpty()) return std::nullopt;
+        else {
             return takeRequestLocked();
         }
     }
-    void shutdown(){
+
+    ssize_t waitAndDrain(std::vector<Request>& out, size_t maxItems, bool* didSleep = nullptr, double* lockNs = nullptr) {
+    size_t drained = 0;
+
+    auto lockStart = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(m);
+    auto lockEnd = std::chrono::steady_clock::now();
+
+    if (lockNs) {
+        *lockNs = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count()
+        );
+    }
+
+    if (didSleep) {
+        *didSleep = (count == 0 && !stopping);
+    }
+
+    convar.wait(lock, [this]{ return count > 0 || stopping; });
+
+    if (stopping && isEmpty()) return drained;
+    else {
+        out.clear();
+        while (count > 0 && drained < maxItems) {
+            auto req = takeRequestLocked();
+            out.push_back(std::move(req));
+            ++drained;
+        }
+    }
+    return drained;
+}
+
+    void shutdown() {
         std::unique_lock<std::mutex> lock(m);
         stopping = true;
         convar.notify_all();
     }
-    RingBuffer(size_t capacity)
-    :capacity(capacity),
-    buffer(capacity){}
 
+    RingBuffer(size_t capacity)
+        : capacity(capacity), buffer(capacity) {}
 };
 
-enum class vio{
+enum class vio {
     crossedBook,
     orphan,
     fifo,
     volumeCon
 };
 
-struct WriterContext{
+struct WriterContext {
     std::vector<Request> captured;
     std::optional<vio> invariant;
     std::optional<size_t> invarIndex;
@@ -482,86 +628,113 @@ struct WriterContext{
     std::atomic<size_t> processed{0};
 };
 
-bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected){
-    if(rejected){
+struct BenchContext {
+    std::vector<double> samples;
+    std::vector<double> lockAcquireNs; // Time spent blocked attempting to acquire std::mutex (per batch)
+    std::vector<double> totalBatchNs;  // Total time including lock acquisition + drain + processing (per op)
+    std::vector<bool> didSleep;
+    size_t drainCap = 64;
+};
+
+bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected) {
+    if (rejected) {
         return ((volAfter - volBefore) == 0 && tradedQty == 0);
-    }else if(orderType == Type::Limit){
-        return (((volAfter - volBefore) == incomingQuantity - (tradedQty*2)));
-    }else{
+    } else if (orderType == Type::Limit) {
+        return (((volAfter - volBefore) == incomingQuantity - (tradedQty * 2)));
+    } else {
         return (((volAfter - volBefore) == -tradedQty));
     }
 }
 
-void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr){
+void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr, BenchContext* btx = nullptr) {
+    std::vector<Request> drained;
 
-    while(true){
-        auto request = queue.waitAndPop();
-        if(!request) break;
-        else{
-            auto& cRequest = *request;
-            //std::println("Popped Request ID: {}", cRequest.id);
-            if(ctx && !ctx->invariant){
-                ctx->captured.push_back(cRequest);
-                ctx->processed.fetch_add(1, std::memory_order_release);
-            }
-            auto& cOrder = cRequest.order;
-            auto& rType = cRequest.requestType;
-            if(rType == OpType::Submit){
-                if(ctx){
+    auto processOne = [&](Request& cRequest) -> void {
+        if (ctx && !ctx->invariant) {
+            ctx->captured.push_back(cRequest);
+            ctx->processed.fetch_add(1, std::memory_order_release);
+        }
+        auto& cOrder = cRequest.order;
+        auto& rType = cRequest.requestType;
+        if (rType == OpType::Submit) {
+            if (ctx) {
                 auto volPreSub = book.totalRestingVolume();
                 auto cOrderQuantity = cOrder.quantity;
                 auto cOrderType = cOrder.type;
                 auto fills = book.submit(cOrder);
                 auto volPostSub = book.totalRestingVolume();
                 int64_t tradeQuantity = 0;
-                if(fills.has_value()){
-                    for(const auto& fill :*fills){
+                if (fills.has_value()) {
+                    for (const auto& fill : *fills) {
                         tradeQuantity += fill.quantity;
                     }
-                    if(!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, false))){
+                    if (!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, false))) {
                         ctx->invariant = vio::volumeCon;
                         ctx->invarIndex = ctx->captured.size() - 1;
                     }
-                }else{
-                    if(!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, true))){
+                } else {
+                    if (!(volumeConserved(volPreSub, volPostSub, cOrderQuantity, tradeQuantity, cOrderType, true))) {
                         ctx->invariant = vio::volumeCon;
                         ctx->invarIndex = ctx->captured.size() - 1;
-                        
                     }
                 }
-                }else{
-                    book.submit(cOrder);
-
-                }
-                //std::println("Submitted Order ID: {}", cOrder.id);
-            }else if(rType == OpType::Modify){
-                book.modify(cRequest.id, cRequest.newPrice, cRequest.newQuantity);
-                //std::println("Modified Order ID : {} with price: {} and quantity: {}", cRequest.id, cRequest.newPrice.value_or((-1)), cRequest.newQuantity.value_or(-1));
-            }else{
-                book.cancel(cRequest.id);
-                //std::println("Cancel Request Fufilled");
+            } else {
+                book.submit(cOrder);
             }
-            if(ctx && !ctx->invariant){
-                if(book.checkNoCrossedBook()){
+        } else if (rType == OpType::Modify) {
+            book.modify(cRequest.id, cRequest.newPrice, cRequest.newQuantity);
+        } else {
+            book.cancel(cRequest.id);
+        }
+
+        if (ctx && !ctx->invariant) {
+            if (book.checkNoCrossedBook()) {
                 ctx->invariant = vio::crossedBook;
                 ctx->invarIndex = ctx->captured.size() - 1;
-                
-            } 
-            if(book.checkNoOrphans() != std::nullopt){
-               ctx->invariant = vio::orphan;
-               ctx->invarIndex = ctx->captured.size() - 1;
-            
-            } 
-            if(!book.checkFIFO()){
+            }
+            if (book.checkNoOrphans() != std::nullopt) {
+                ctx->invariant = vio::orphan;
+                ctx->invarIndex = ctx->captured.size() - 1;
+            }
+            if (!book.checkFIFO()) {
                 ctx->invariant = vio::fifo;
                 ctx->invarIndex = ctx->captured.size() - 1;
-            
-            } 
             }
-            
+        }
+    };
+
+    if (btx) {
+        drained.reserve(btx->drainCap);
+
+        while (true) {
+            bool slept = false;
+            double lockNs = 0.0;
+            auto start = std::chrono::steady_clock::now();
+
+            size_t n = queue.waitAndDrain(drained, btx->drainCap, &slept, &lockNs);
+            if (n == 0) break;
+
+            for (auto& r : drained) {
+                processOne(r);
+            }
+
+            auto end = std::chrono::steady_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+            btx->samples.push_back(static_cast<double>(ns) / static_cast<double>(n));
+            btx->didSleep.push_back(slept);
+            btx->lockAcquireNs.push_back(lockNs);
+        }
+    } else {
+        drained.reserve(64);
+        while (true) {
+            size_t n = queue.waitAndDrain(drained, 64);
+            if (n == 0) break;
+            for (auto& r : drained) {
+                processOne(r);
+            }
         }
     }
-
 }
 
 

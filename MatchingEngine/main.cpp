@@ -81,9 +81,9 @@ int main() {
     }*/
 
     OrderBook book;
-    book.rest(Order{Side::Sell, Type::Limit, 102, 100, 1, 0});
-    book.rest(Order{Side::Sell, Type::Limit, 102, 50, 2, 0});
-    book.rest(Order{Side::Buy, Type::Limit, 102, 120, 3, 0});
+    //book.rest(Order{Side::Sell, Type::Limit, 102, 100, 1, 0});
+    //book.rest(Order{Side::Sell, Type::Limit, 102, 50, 2, 0});
+    //book.rest(Order{Side::Buy, Type::Limit, 102, 120, 3, 0});
 
     std::cout << book.quantityAt(Side::Sell, 999) << "\n";
     std::cout << book.quantityAt(Side::Sell, 102) << "\n";

@@ -20,6 +20,9 @@ struct Order{
     int64_t id;
     int64_t seq;
 
+    Order* next = nullptr;
+    Order* prev = nullptr;
+
 };
 
 

@@ -116,3 +116,13 @@ public:
         return result;
     }
 };*/
+
+bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQty, Quantity tradedQty, Type orderType, bool rejected){
+        if(rejected){
+            return((volAfter - volBefore) == 0 && tradedQty == 0);
+        }else if(orderType == Type::Limit){
+            return((volAfter - volBefore) == incomingQty - (2*tradedQty));
+        }else{
+            return ((volAfter - volBefore) == -tradedQty);
+        }
+}
