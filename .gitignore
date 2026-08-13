@@ -1,0 +1,21 @@
+# Build output
+build/
+*.dSYM/
+
+# Compiled binaries (no extension)
+main
+tests
+tests_asan
+tests_tsan
+testprofile
+benchmark
+throughput
+orderBook
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# Run artefacts
+run_output.txt
+profile.txt
