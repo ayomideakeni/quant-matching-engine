@@ -2,6 +2,8 @@
 
 *A limit order book matching engine in modern C++ — price-time priority, a single-writer concurrency layer, and correctness demonstrated rather than asserted.*
 
+**Status: feature-complete.** Built over summer 2026 as a self-directed project. The core is correct, concurrent, verified under both sanitisers, measured across book depths and execution paths, profiled, and optimised through a full profile → optimise → re-measure loop. Everything in *Future Work* is genuinely optional — the project is not paused mid-build.
+
 ---
 
 ## What it does
@@ -22,7 +24,9 @@ The matching core is single-threaded by design, not by omission. A concurrency l
 | Shrinker | Proven against injected bugs (34→20 single-threaded, 19→2 queued) |
 | Determinism | Verified in both directions — byte-identical books on replay |
 | ThreadSanitizer | Clean across the full suite |
-| Benchmarking | p50/p99/p99.9/max for five operations, swept across four book depths |
+| Benchmarking | p50/p99/p99.9/max for five operations, four book depths, and the concurrent path |
+| Optimisation | Full profile → optimise → re-measure loop; submit-resting from 20.8–62.5 ns to a flat **8.3 ns** |
+| AddressSanitizer | Clean across the full suite |
 
 ### Implemented
 
@@ -34,18 +38,14 @@ The matching core is single-threaded by design, not by omission. A concurrency l
 - Bounded MPSC ring buffer (mutex + condition variable) with a stated overflow policy
 - Single-writer loop with two-phase drain on shutdown
 - Producer-partitioned, self-describing order ids
-- Latency percentile harness with book-depth sweep
-
-### In progress
-
-- Concurrent-path latency measurement
-- Profile → optimise → re-measure, against two evidence-backed candidates (below)
+- Intrusive linked list with a hand-rolled order pool — fixed-capacity, free-list, fail-on-exhaustion
+- Latency percentile harness with book-depth sweep and end-to-end concurrent measurement
 
 ### Out of scope for v1
 
 Response path (designed, not built), self-trade prevention, persistence, risk and pricing models. See *Scope*.
 
-See `devlog.md` for session-by-session build progress, including the failures.
+See `dev_log` for session-by-session build progress — including the bugs, the wrong predictions, and the two optimisations that were built and reverted.
 
 ---
 
@@ -115,17 +115,19 @@ A single price-keyed map, because it needs a composite key or an internal filter
 
 **Choice**
 
-Each level stores orders in a `std::list` in FIFO order. New orders append at the back; matching removes or partially fills from the front.
+Each level stores orders as an **intrusive doubly-linked list** in FIFO order — the `next`/`prev` links live on the `Order` itself, and a `Level` holds only `head` and `tail` pointers. New orders link at the back; matching consumes from the front. Storage comes from a **fixed-capacity pool** (see *The optimisation*).
 
 **Why**
 
-`std::list` gives the strongest iterator-stability guarantee available: erasing or inserting anywhere — including the middle — invalidates *only* the iterator to the element actually erased. Every other iterator held anywhere else in the program stays valid. That is exactly what a long-lived cancel index needs.
+The requirement is stable handles: a cancel index holds a reference to an order for its entire life, so anything that moves orders in memory breaks it. Both an intrusive list and `std::list` provide that. The intrusive version additionally removes the node wrapper and its per-insertion allocation, and lets the pool own the storage layout end to end.
+
+**This started as `std::list`, and the change was driven by measurement, not preference.** `std::list` gives the strongest invalidation guarantee in the standard library — erasing anywhere invalidates *only* the iterator to the erased element — which is exactly what the cancel index needs, and it was the right first choice. What it also does is allocate a node on every insertion, and profiling put that allocation ~50:1 ahead of tree manipulation as a cost. Removing it took submit-resting from 20.8–62.5 ns to a flat 8.3 ns.
 
 **Rejected**
 
-`std::vector`, because it reallocates on growth and every iterator into the old buffer dangles. `std::deque`, because its invalidation rules on arbitrary insertion and erasure are weaker and less uniform than a list's — a real risk for a structure that needs *iterator* stability specifically, not just reference stability.
+`std::vector`, because it reallocates on growth and every handle into the old buffer dangles. `std::deque`, because its invalidation rules on arbitrary insertion and erasure are weaker and less uniform.
 
-The cost — worse cache locality and per-node overhead versus a contiguous container — is accepted and revisited under measurement, not instinct. The depth sweep below now provides that measurement.
+**`std::hive`** (accepted for C++26, formerly `plf::colony`) is designed for exactly this shape — many objects, frequent erasure, stable references, a skipfield keeping iteration cache-friendly. It is rejected on a hard constraint: **hive makes no ordering guarantee**, and a price level is a FIFO queue where *the order is price-time priority*. Restoring order means threading elements with links you own, at which point you have written an intrusive list anyway.
 
 ---
 
@@ -133,7 +135,7 @@ The cost — worse cache locality and per-node overhead versus a contiguous cont
 
 **Choice**
 
-A hash map from order id to a stable iterator into a price level's list. The index stores **only** the iterator.
+A hash map from order id to a stable `Order*` into the pool. The index stores **only** the pointer.
 
 **Why**
 
@@ -336,6 +338,10 @@ Fixed-capacity `vector<Request>` allocated once at construction, `head`/`tail`/`
 
 **Two pops, deliberately, because `nullopt` means two different things.** `pop()` is non-blocking and `nullopt` means "nothing right now." `waitAndPop()` blocks, so `nullopt` can only mean **"stopping, and nothing left — exit."** Two behaviours deserve two names; one overloaded name is how a caller waits when it meant to poll.
 
+**A third method, `waitAndDrain`, added after measurement.** It takes the lock once and drains up to N requests into a caller-supplied vector, which the writer then dispatches *outside* the lock. Dispatching under the lock would block producers for N × ~42 ns, which is worse than the behaviour it replaces. The vector is owned and reserved by the writer, so the drain never allocates.
+
+**The result was mostly negative, and that was informative.** Batching cut the far tail ~20–40% and did nothing to p50. If the queue's per-operation cost had been lock acquire/release overhead, amortising it across ten operations would have shown at the median. It did not — which ruled out lock *overhead* and pointed at lock *contention*, later confirmed directly.
+
 **The condition variable is writer-side only.** `wait(lock, predicate)` sleeps *and atomically releases the mutex while sleeping*. Both halves are essential — without the release, a writer sleeping while holding the lock would block every producer, so nothing could make the queue non-empty and nothing could wake it. The predicate form is mandatory because threads can wake with **no notification at all**; the predicate is `count > 0 || stopping`, where the second half is what lets shutdown wake a sleeping writer.
 
 `push` must **not** wait — an early draft that reused the same `wait` deadlocked on the very first call, with the first producer at an empty queue sleeping to wait for an item only it could have supplied. The distinction that resolves it: producers *do* take the mutex, briefly and boundedly, but "producers never block" means **overflow waiting** — sleeping until a slot frees, which is unbounded. A full queue returns `false` immediately.
@@ -500,17 +506,22 @@ Batch **10** for four of five benchmarks: ~8% overhead, stated, with a stall sti
 
 ## Results — five operations (ns, `-O3`, single-threaded, Apple M4)
 
-| Operation | mean | p50 | p99 | p99.9 | max |
-|---|---|---|---|---|---|
-| Submit — resting only | 38.8 | 33.4 | 83.3 | 237.5 | **10404.1** |
-| Submit — always crosses | 38.5 | 37.5 | 50.0 | 95.9 | 191.7 |
-| Cancel | 28.8 | 29.2 | 41.7 | 70.8 | 154.2 |
-| Modify — in-place | 3.6 | 3.34 | 5.83 | 10.83 | 19.58 |
-| Modify — cancel + resubmit | 55.9 | 54.2 | 83.3 | 91.7 | 141.7 |
+Two sets: the baseline that motivated the optimisation, and the current numbers after it.
 
-Mixed flow at depth 100: mean 44.6 · p50 41.7 · p99 104.2 · p99.9 187.5 · max 679.2.
+| Operation | | mean | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| Submit — resting only | before | 38.8 | 33.4 | 83.3 | 237.5 | **10404.1** |
+| | **after** | — | **8.3** | **8.4** | — | — |
+| Submit — always crosses | before | 38.5 | 37.5 | 50.0 | 95.9 | 191.7 |
+| Cancel | before | 28.8 | 29.2 | 41.7 | 70.8 | 154.2 |
+| Modify — in-place | before | 3.6 | 3.34 | 5.83 | 10.83 | 19.58 |
+| Modify — cancel + resubmit | before | 55.9 | 54.2 | 83.3 | 91.7 | 141.7 |
 
-**Submit-resting's tail is pathological and submit-crossing's is not**, despite near-identical means (38.8 vs 38.5) and near-identical bodies. Max differs by **54×**. The mechanical difference is that resting allocates a `std::list` node every time while crossing mostly consumes existing ones. A batch *mean* of 10,404 ns means a single operation inside that batch was likely far worse — the true max is worse than this harness can see, which is an inherent limit of batching, stated rather than hidden.
+Mixed flow at depth 100, before → after: mean 44.6 → **37.8–38.5** · p50 41.7 → **37.5** · p99 104.2 → **75–79** · p99.9 187.5 → **100**.
+
+**Submit-resting's tail was pathological and submit-crossing's was not**, despite near-identical means (38.8 vs 38.5) and near-identical bodies. Max differed by **54×**. The mechanical difference is that resting allocated a `std::list` node every time while crossing mostly consumes existing ones. A batch *mean* of 10,404 ns means a single operation inside that batch was likely far worse — the true max is worse than this harness can see, which is an inherent limit of batching, stated rather than hidden.
+
+**That observation drove the whole optimisation phase**, and it turned out to be right for the right reason. See *Profiling* and *The optimisation* below.
 
 **Modify-in-place carries a caveat that the number alone hides.** ~3.3 ns is roughly 10 cycles for a hash lookup, an iterator dereference, branch checks and a write. It is plausible only because this benchmark is unusually cache-friendly — sequential access, ~90 price levels reused, whole working set in L1. The honest claim is *"3.3 ns under a sequential access pattern with a small working set,"* not *"modify costs 3.3 ns."*
 
@@ -520,6 +531,8 @@ Reporting a single figure implicitly claims the curve is flat. `std::map` is a r
 
 Two methodology decisions keep this honest. Depth is swept at **constant orders per level**, not constant total, so tree width is isolated rather than traded against list depth. And the **seeding** is parameterised rather than the generator's price band, because widening the band would also collapse the crossing rate the band was chosen to maximise — moving two variables at once.
 
+**Before the optimisation:**
+
 | levels | sub rest | sub cross | cancel | mod qty | mod price |
 |---|---|---|---|---|---|
 | 10 | 20.8 | 41.7 | 62.5 | 6.2 | 100.0 |
@@ -527,25 +540,147 @@ Two methodology decisions keep this honest. Depth is swept at **constant orders 
 | 1000 | 29.1 | 50.0 | 120.8 | 7.5 | 191.7 |
 | 10000 | 62.5 | 58.4 | 204.1 | 7.1 | 391.6 |
 
-Growth from 10 → 10,000 levels: submit-resting **3.0×**, submit-crossing 1.4×, cancel **3.3×**, modify-quantity **flat**, modify-price **3.9×**.
+**After:**
 
-**Everything that touches the map scales with depth; the one operation that does not touch the map is flat.** Modify-price scales worst because it does the most map work — a cancel plus a submit.
+| levels | sub rest | sub cross | cancel | mod qty | mod price |
+|---|---|---|---|---|---|
+| 10 | **8.3** | 33.3 | **37.5** | 5.0 | **70.9** |
+| 100 | **8.3** | 41.7 | **45.9** | 4.6 | **100.0** |
+| 1000 | **8.3** | 41.6 | **54.2** | 4.6 | **125.0** |
+| 10000 | **8.4** | 45.9 | **95.9** | 4.6 | **225.0** |
 
-## What the measurements found
+**Submit-resting is now flat.** It grew 3.0× across the sweep before; now it is 8.3 ns at every depth, reproducible across three runs — **7.4× faster at 10,000 levels, with the depth-dependence gone entirely.** That says its old growth was *wholly* allocation-related (bigger book → more heap pressure → slower `malloc`), not tree traversal.
 
-**Cancel's 3.3× was not predicted.** Cancel does a hash lookup and an O(1) list erase, neither of which should care about level count. Reading the code explains it — the cleanup step is `if (map.at(p).orders.empty()) { map.erase(p); }`, where `at(p)` walks the tree and `erase(p)` walks it **again** to find the same node, on top of the traversal that located the order. **Three tree traversals per cancel where one would do.** The fix needs no new data structure: `find` once, test through the returned iterator, `erase(iterator)`.
+**And its tail collapsed with it: p99 of 8.4 ns against a p50 of 8.3.** Before, p99 at depth was 108–195 ns against a p50 of 62.5. The tail did not shrink — **it disappeared** — which is precisely what removing a *variable* cost predicts. A free-list pop is the same three instructions every time; there is nothing left to vary.
 
-**Deliberately not fixed yet** — it is a candidate found by measurement, and fixing it now would mean the baseline no longer matches the profile, destroying the before/after curve.
+Cancel is 2.1× faster at depth, modify-price 1.5×. Both still scale, so genuine tree cost remains in those paths. **Modify-in-place is unchanged at ~5 ns** — the control, since it never allocated.
 
-**Two findings, two different signatures, not in conflict.** The tail (submit-resting's 10,404 ns max against crossing's 191 ns, identical bodies) points at **allocation** — a rare, expensive event. The depth curve (systematic 3–4× growth with tails staying *proportionate*) points at **tree traversal** — a constant, growing tax. The proportionate tails are the informative part: if depth were causing occasional expensive events, p99/p50 would widen as misses became likelier. It does not; the whole distribution shifts together, which is what a systematic per-operation cost looks like rather than a probabilistic one.
+## Concurrent path
+
+Measured by batch-timing the writer loop itself: one thread, one clock, no cross-thread timestamp comparison, and no permanent field added to `Request` to carry a timestamp.
+
+| | before pool | after pool |
+|---|---|---|
+| p50 | 50.0 | **45.8** |
+| p99 | 1425–1546 | **1250–1283** |
+| p99.9 | 3954–4296 | **3658–3792** |
+
+**Against a direct-call mixed-flow p50 of 41.7 ns, the queue costs roughly 8 ns per operation** on the common path.
+
+**The same optimisation improved the concurrent path far less than the single-threaded one** — ~13% at p99 against 25%, ~7% at p99.9 against 47%. That gap is the finding, and diagnosing it is below.
+
+---
+
+# Profiling
+
+The discovery gate: everything above is observation; this attributes time to causes.
+
+**Two hypotheses were registered in advance**, each backed by different evidence — **allocation** (submit-resting's 10,404 ns max against crossing's 191 ns, identical bodies) and **tree traversal** (the 3–4× depth curve, with tails staying *proportionate* rather than fattening, which is the signature of a systematic per-operation cost rather than a probabilistic one). Registering both in advance is what makes a profile informative: it adjudicates a prediction rather than starting from nothing.
+
+**Tooling.** No Xcode, so no Instruments — macOS's built-in `sample` instead. Both are *sampling* profilers: they report where time is spent statistically, not exact counts, and at `-O3` an inlined function's time is attributed to its caller, which makes attribution coarser.
+
+**Two methodology errors, both caught.** The first run was **80% process startup** — 234 of 285 main-thread samples were `_dyld_start`. And `sample` attaches immediately, so it catches startup regardless of run length; fixed with a two-second head start before a ten-second window. A third error was in the *reading*: `grep -c` counts lines, not sample weight, and in a call tree the same function appears at many depths.
+
+**Result — writer thread, 4 producers:**
+
+| | samples | share |
+|---|---|---|
+| Dispatch (real engine work) | 942 | 53% |
+| `waitAndDrain` | 764 | **43%** |
+
+Almost all of the 43% is `std::mutex::lock` → `__psynch_mutexwait` — the writer **blocked in the kernel waiting for the queue mutex**.
+
+**Within the engine's own work:**
+
+| Symbol | 4 producers | 1 producer |
+|---|---|---|
+| `malloc` | 413 | 101 |
+| `_free` | 215 | 66 |
+| `operator new` | 111 | 38 |
+| `__tree_balance_after_insert` | 20 | 4 |
+| `__tree_remove` | 30 | **0** |
+
+**Allocation outweighs tree manipulation roughly fifty to one, and the ratio holds at both producer counts.**
+
+**Allocation confirmed. Tree traversal refuted — as stated.** Comparisons and rebalancing are nearly free. But the depth curve was real and reproducible, so something does scale with depth: it is the **cache misses from chasing separately-allocated tree nodes**, not the tree logic. Each hop is a separately-allocated node and therefore a potential trip to main memory. The depth curve is an allocation-layout problem wearing a different hat.
+
+**On the 43% contention figure, stated precisely.** `concurrentBench`'s producers push in a tight loop with zero work between pushes — close to worst-case contention. Re-profiling at one producer dropped `waitAndDrain` to 29% and collapsed `__psynch_mutexwait` from 628 samples to 62. So **contention ranges 29–43% of writer time across the producer counts tested, and where a real deployment sits depends on producer-side work not modelled here.** Neither endpoint is "the true number."
+
+---
+
+# The optimisation
+
+## Intrusive list + order pool
+
+Every `rest` called `push_back` on a `std::list`, allocating a node — a `malloc` on the hottest path, and a **variable** one. Variance is where tail latency comes from.
+
+**Three routes were considered.** A `pmr` allocator (cheapest, and `null_memory_resource` upstream would make "did it stay in the pool?" something the program *enforces* rather than something you assume). A hand-rolled allocator for `std::list` (same category of change at several times the cost — cut). Or an intrusive list with a pool.
+
+**The intrusive list was chosen**, addressing both profile findings with one design, at the stated cost that **it changes allocation *and* layout *and* the container at once, so the resulting curve reflects all three.** That was accepted deliberately: the debugging apparatus already built — four invariants per operation, a million-op fuzzer, a shrinker, a determinism check, both sanitisers — is exactly what makes replacing a proven container survivable.
+
+**`std::hive` was considered and rejected on a hard constraint.** It is designed for precisely this case — many objects, frequent erasure, stable references, a skipfield keeping iteration cache-friendly. But **hive makes no ordering guarantee**, and a price level is a FIFO queue where *the order is price-time priority*. Restoring order means threading elements with links you own, at which point you have written an intrusive list anyway — with a dependency supplying the easy part and the pointer-chasing back.
+
+**The pool.** A `vector<Order>` sized N plus a `freeHead` pointer, with the free list threaded **through the same `next` links the live list uses** — a free slot is not a real order, so its `next` stores the next free slot. Zero extra memory for the bookkeeping, and the constructor is literally "free every slot."
+
+- **Constructed `Order`s rather than raw storage.** The textbook approach is `alignas`-wrapped byte arrays plus placement new. Rejected as ceremony: that machinery produces "a correctly-sized, correctly-aligned block that could hold an `Order`" — which is what an `Order` already is. It earns its place when construction is expensive or the destructor non-trivial; `Order` is six scalars. Noted as *not* what a production allocator would do.
+- **Fail on exhaustion, not grow.** Growing *is* a `malloc` — a large one — trading frequent small variance for infrequent large variance, which in tail terms is worse. Falling back to `malloc` reinstates the cost being removed. **Deterministic refusal beats unpredictable delay**, the same argument as the queue's overflow policy one layer down.
+- **Copy and assignment deleted**, because `freeHead` points into the object's own vector. That guard immediately caught a real bug at compile time: a replay helper returned an `OrderBook` **by value**, which would have produced a book whose free list pointed into the original's storage.
+- **Capacity checking belongs in `rest`, not `validate`.** `validate` asks "is this order well-formed?" — a property of the order, whose answer does not depend on anything else. Exhaustion asks "does the book have room right now?" — a property of book state.
+
+**The iterator that made it tractable.** Changing `Level` from a `std::list` to `head`/`tail` pointers produced 13 compile errors, eight of which were "walk every order in this level" — the volume observers, `checkFIFO`, `quantityAt`, `idsAt`. Giving `Level` a `begin()`/`end()` pair meant **all eight range-for loops compiled with only `.orders` deleted.** That matters disproportionately: several of those eight *are* the correctness apparatus, and a mistake in `checkFIFO` would break the test that catches mistakes elsewhere.
+
+**Verified under AddressSanitizer** across the full suite, plus determinism over 1,000,000 captured operations replaying byte-identical. ASan is load-bearing here: for a change replacing a standard container with hand-written pointer manipulation, checking every memory access matters more than checking outcomes.
+
+## Diagnosing the concurrent tail — three experiments, two negative results
+
+The single-threaded numbers improved dramatically. The concurrent path barely moved. **This is why.**
+
+**Experiment 1 — spin before sleeping. Negative.** Hypothesis: the tail is condvar wake-ups, and the queue is often empty for less than a context switch, so a bounded spin would catch short gaps. Calibrated rather than guessed — **0.357 ns per atomic acquire-load, ~2,800 iterations per microsecond**, noted as an upper bound since an uncontended L1 load is the best case. **Result: nothing**, at either 4 or 16 producers. Measured at both specifically because the 16-producer case had no pool-only baseline, and without one the pool and the spin would have been entangled. **Reverted** — carrying code that does nothing is worse than not having it.
+
+**Experiment 2 — partition samples by whether the drain actually slept. Decisive.** `wait(lock, pred)` does not report whether it blocked, so the technique is to check the predicate yourself *while holding the lock*: if already true, `wait` returns immediately. **Result: exactly 1 drain in 320,000 ever slept.** The entire p99.9 lives in the fast path — 319,999 drains that never touched the condition variable and still produced ~320 samples two orders of magnitude above the median. That eliminates idle time and wake-up latency, and explains experiment 1's null result: there was nothing to catch.
+
+**Experiment 3 — time the lock acquisition separately. The answer.**
+
+| Lock acquisition, per batch | value |
+|---|---|
+| p50 | **0 ns** |
+| p99 | **42 ns** |
+| p99.9 | **93,000–104,000 ns** |
+| max | 472,000–941,000 ns |
+
+**Starkly bimodal.** 99% of the time the writer takes the lock instantly; roughly 1 in 1,000 times it waits **100 microseconds**.
+
+**The arithmetic closes exactly.** The lock's p99.9 is per *batch*; the drain's p99.9 of ~10,000 ns is per *operation* at drain cap 10. 10,000 × 10 = 100,000 ns. **The entire drain tail is lock acquisition** — convoying, matching the profile's 43%-blocked finding.
+
+And the mean lock cost of ~320 ns against a p50 of 0 is the clearest illustration in the project of why percentiles matter: a rare 100 µs event drags an average into a number describing no actual operation.
+
+## The lock-free queue — built, measured, reverted
+
+With a specific mechanistic diagnosis, it was worth building. Bounded MPSC ring buffer with a **per-slot sequence number** as a publication marker: slot *i* is writable when its sequence equals *i*, readable at *i + 1*, with monotonic indices wrapping only at index time. Producers CAS the tail then **release-store** the sequence to publish; the single consumer **acquire-loads** it before reading and release-stores it forward by capacity to free the slot. ABA does not arise — the CAS is on a monotonically increasing integer, not a pointer.
+
+| | mutex | lock-free |
+|---|---|---|
+| p99.9 | ~10,000 ns | **542–583 ns** |
+| max | 47,000–94,000 ns | **1,000,000–9,000,000 ns** |
+| samples per run | 320,000 | 489,000–549,000 |
+
+**It worked on exactly the thing it targeted** — the 100 µs spikes are gone, p99.9 improved **17×**. **And it introduced a worse extreme**: millisecond-scale maxima, two to three orders of magnitude worse and wildly variable. The sample counts also make the comparison unsound — ~500,000 drains for the same work means many returned one or two items, so per-operation figures are not comparable.
+
+**Reverted, and the reasoning changed.** The original rejection was *"a too-weak memory ordering is silent and my test infrastructure is blind to it."* That is no longer honest — it was built and TSan came back clean. The measured version: *it eliminated the lock-acquisition spikes but introduced millisecond maxima and an incomparable distribution; the mutex version's behaviour is understood and bounded, and the lock-free version's is neither.*
+
+**One caveat survives regardless:** TSan detects *races*, not insufficient orderings. An `acquire` where `seq_cst` was needed is a correctly-synchronised access with too weak an ordering, so there is no race to find.
+
+## What the sequence established
+
+The tail was hypothesised to be wake-up latency; a spin ruled that out; partitioning proved the writer sleeps essentially never; timing the acquisition attributed the entire tail to lock contention; and building the alternative confirmed the mechanism while surfacing a different problem. **Two negative results and one confirmed diagnosis — and the negatives were the more informative**, because each eliminated a hypothesis that would otherwise still be live.
 
 ## Measurement artifacts characterised
 
-**Cold start is per-process, not per-benchmark.** The first sweep showed an anomalous p99 in the 10-level row. Reversing the sweep order moved the anomaly to the 10,000-level row, proving it followed *position*, not depth. Per-benchmark warm-up does not cover it, because caches and branch predictors are cold at **process** start. Fixed with a process-level warm-up.
+**Cold start is per-process, not per-benchmark.** The first sweep showed an anomalous p99 in the 10-level row. Reversing the sweep order moved the anomaly to the 10,000-level row, proving it followed *position*, not depth. Fixed with a process-level warm-up.
 
-**Tail statistics need repetition in a way medians do not.** After the process warm-up, one cancel p99 read 591.7 in one run and 125.0 in the next with nothing else changed — while the medians were reproducible to within a nanosecond throughout.
+**Tail statistics need repetition in a way medians do not.** One cancel p99 read 591.7 in one run and 125.0 in the next with nothing else changed — while medians were reproducible to within a nanosecond throughout.
 
-**One result recorded as unexplained:** submit-crossing's p99 at 10 levels ran 145.9 / 191.7 / 220.8 across runs against ~70–79 ns at every other depth. Persistent in direction, wildly variable in magnitude. Plausible mechanism — at 10 levels the aggressor is far likelier to consume an entire level and pay the erase path — but not confirmed.
+**One result recorded as unexplained:** submit-crossing's p99 at 10 levels ran 145.9 / 191.7 / 220.8 / 954.2 across runs against ~45–79 ns at every other depth. Persistent in direction, wildly variable in magnitude. Plausible mechanism — at 10 levels the aggressor is far likelier to consume an entire level and pay the erase path — but not confirmed.
 
 ## Contention sweep — a characteristic, not a measurement
 
@@ -557,11 +692,11 @@ Total operations held constant at 400,000 (400k×1, 100k×4, 25k×16) so book si
 | 4 | 5.05 s |
 | 16 | 9.06 s |
 
-Roughly doubling per 4× in producers. The prediction going in was "no measurable difference," reasoning that the writer is thousands of times slower so producers rarely collide. **That reasoning was incomplete: producers contend with each other, not only with the consumer.** Sixteen threads whose entire job is lock → write → notify → unlock is close to worst-case contention regardless of what the consumer is doing. Three plausible contributors, stated as hypotheses: the writer shares that mutex, so producer contention **starves the consumer** (convoying — the same phenomenon that made the global lock unattractive, surfacing in the one place a lock survived); `notify_one` fires on every push inside the critical section even when nobody is waiting; and 16 threads on ~10 cores means threads are descheduled *while holding the mutex*.
+The prediction going in was "no measurable difference," reasoning that the writer is thousands of times slower so producers rarely collide. **That reasoning was incomplete: producers contend with each other, not only with the consumer.**
 
-**Caveat, stated rather than buried:** single runs, no variance, and an instrumented writer that dominates absolute times. The *trend* across three points is consistent enough to believe; the individual numbers are not measurements. Recorded as a known characteristic with a hypothesis.
+**Caveat, stated rather than buried:** single runs, no variance, and an instrumented writer that dominates absolute times. The *trend* is consistent enough to believe; the individual numbers are not measurements.
 
-**None of this session's absolute timings say anything about the engine.** They measure the instrumented build, where checking dominates matching by orders of magnitude. A 30-million-operation run with prints enabled took 40 seconds of CPU and over 90 minutes of wall clock — ~99.99% of it terminal I/O. **Printing per operation makes the print the workload.**
+**None of these absolute timings say anything about the engine.** They measure the instrumented build. A 30-million-operation run with prints enabled took 40 seconds of CPU and over 90 minutes of wall clock — ~99.99% of it terminal I/O. **Printing per operation makes the print the workload.**
 
 ---
 
@@ -595,13 +730,14 @@ Kept because each carries a transferable lesson, not for completeness.
 - Property-based invariant testing with a proven shrinker
 - Single-writer concurrency layer: producer-partitioned ids, bounded MPSC queue, two-phase drain
 - Concurrent verification: queued fuzzing, determinism check, adversarial interleaving tests, ThreadSanitizer
-- Latency percentile harness with a book-depth sweep
+- Intrusive linked list with a hand-rolled fixed-capacity order pool
+- Latency percentile harness with a book-depth sweep, concurrent-path measurement, and a profile-driven optimisation loop
 
 ### Out of scope
 
 - **Response path** — designed in full (per-producer SPSC, routed by id high bits), not built; demonstrates nothing the request path does not
 - **Self-trade prevention** — requires a participant/account model the engine does not have. A plausible future extension, not a gap
-- **Lock-free queue** — rejected on verifiability, with the upgrade path left open
+- **Lock-free queue** — built and measured, then reverted. It fixed the lock-acquisition tail it targeted (p99.9 ~10,000 ns → 583 ns) but introduced millisecond-scale maxima. The rejection is empirical, not precautionary
 - **Persistence / event log** — the ring buffer is transit, not storage
 - **Risk, margin, pricing models, derivatives** — dropped, not deferred; the book does not need to know what it is trading
 
@@ -609,11 +745,18 @@ Kept because each carries a transferable lesson, not for completeness.
 
 # Future Work
 
-- Concurrent-path latency measurement, then profile → optimise → re-measure against the two evidence-backed candidates: **cancel's three redundant tree traversals** (zero-risk, no new data structure) and **allocation on the resting path** (the tail signature)
-- A measured comparison against a flat price-array or tombstone-vector level layout — now motivated by the depth sweep rather than by instinct. Note the two candidates conflict: an iterator-based cancel index requires stable storage, so it cannot coexist with a vector layout
+- **Reducing lock contention on the queue**, which the diagnosis identified as the entire remaining tail. The lock-free version fixed it and cost more elsewhere; a split-lock design or a different waiting strategy are untried
+- A measured comparison against a **flat price array** — motivated by the depth curve, which shows cache misses from chasing tree nodes are real. Rejected for now because it requires **bounding the price range**, a domain constraint the design does not currently make and which would need justifying against a real venue's rules rather than assumed
+- Producer-side pacing in the benchmark harness, so contention figures reflect realistic arrival rates rather than a tight push loop
 - Horizontal sharding by instrument — one book, one writer per symbol — which is the only scaling path that does not cross the sequential constraint
 - The response path, if a requirement for it appears
 - A participant/account model, enabling genuine self-trade prevention
+
+### Known limitation
+
+`submit` discards `rest`'s return value. If the order pool were exhausted when a limit order's unmatched remainder tried to rest, the remainder would be dropped silently — the caller would receive its fills with no indication that part of the order never made it into the book. That is the silent-drop behaviour rejected everywhere else in the design, and it is a real hole in the rejection path.
+
+It has never fired: the pool is sized well beyond the peak live order count in every test, and no run has ever exhausted it. But "has not happened" is not the same as "cannot happen", and the fix is to propagate the failure rather than swallow it. Recorded rather than quietly left.
 
 ---
 
