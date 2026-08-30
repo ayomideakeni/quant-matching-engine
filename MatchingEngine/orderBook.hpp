@@ -522,7 +522,7 @@ private:
     std::vector<Request> buffer;
     alignas(64) std::atomic<size_t> head{0};
     alignas(64) std::atomic<size_t> tail{0};
-    std::atomic<size_t> count = 0;
+    size_t count = 0;
     alignas(64) std::mutex m;
     std::condition_variable convar;
     bool stopping = false;
@@ -537,7 +537,7 @@ private:
     }
     Request takeRequestLocked() {
         auto request = buffer[head];
-        head = (head + 1) % capacity;
+        head = (head + 1) & (capacity - 1);
         --count;
         return request;
     }
@@ -548,9 +548,12 @@ public:
         if (isFull()) return false;
         else {
             buffer[tail] = r;
-            tail = (tail + 1) % capacity;
+            tail = (tail + 1) & (capacity - 1);
             ++count;
-            convar.notify_all();
+
+
+            lock.unlock();
+            convar.notify_one();
             return true;
         }
     }
@@ -606,11 +609,16 @@ public:
     void shutdown() {
         std::unique_lock<std::mutex> lock(m);
         stopping = true;
-        convar.notify_all();
+        lock.unlock();
+        convar.notify_one();
     }
 
-    RingBuffer(size_t capacity)
-        : capacity(capacity), buffer(capacity) {}
+    RingBuffer(size_t requested){
+        capacity = 1;
+        while(capacity < requested) capacity *= 2;
+        buffer.resize(capacity);
+    }
+        
 };
 
 enum class vio {

@@ -1338,8 +1338,7 @@ void runRingBufferTests(){
 }
 
 
-
-#ifndef TESTS_NO_MAIN
+//#ifndef TESTS_NO_MAIN
 
 
 int main(){
@@ -1655,4 +1654,4 @@ int main(){
  
         return 0;
 }
-#endif
+//#endif
