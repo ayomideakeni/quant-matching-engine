@@ -15,6 +15,7 @@
 | Concurrency (design) | Primitives, model derivation, queue design |
 | Concurrency (build) | MPSC queue, single-writer loop, adversarial tests |
 | Benchmarking | Percentile harness, depth sweep, profiling, optimisation |
+| Hardening | Multi-TU correctness sweep, benchmark instrument rebuild, queue bounding |
 
 ---
 
@@ -48,13 +49,92 @@
 | Book-size sweep | ✅ done | 4 depths, 10 → 10,000 levels |
 | Concurrent path measurement | ✅ done | queue overhead quantified; batched drain measured against a controlled baseline |
 | `waitAndDrain` — batched consumer pops | ✅ done | determinism re-verified over 1 M operations |
-| Profile → optimise → re-measure | ⬜ next | — |
+| Profile → optimise → re-measure | ✅ done | allocation identified ~50:1 over tree work; pool + intrusive list cut resting submits 20.8–62.5 ns → flat 8.3 ns (7.4× at depth) |
+| Lock-free MPSC queue (concurrent-tail diagnosis) | ✅ built, measured, reverted | p99.9 improved 17× but introduced millisecond-scale maxima; reverted on measurement |
+| Multi-TU correctness sweep (`orderBook.hpp`) | ✅ done | full suite + both sanitisers + fuzzer green; 2-TU link verified |
+| Benchmark instrument rebuild (`BenchSample`, weighted stats) | ✅ done | index-correspondence and reallocation bugs fixed; percentiles now operation-weighted |
+| Concurrent-path saturation finding | ✅ measured | queue never drops below a full batch at any producer count ≥ 1; writer is the binding constraint |
+| Bounded queue + retry/yield pacing | ✅ built, measured | reject-on-full now genuinely exercised; bounded vs unbounded trade-off characterised at 2 and 8 producers |
+| Warm-up for `concurrentBench` | ⬜ designed, not filled in | parameter and branch exist; sizing and generation outstanding |
  
-**Status: correct, concurrent, tested, and measured.** 23 hand-written tests · 100k single-threaded fuzzed operations across 4 invariants with zero violations · a shrinker proven against an injected bug · 1.6 M operations through the queue across 1–16 producers · determinism verified in both directions · clean under ThreadSanitizer · latency percentiles across five operations, four book depths, and the end-to-end concurrent path. The matching core is byte-identical to its single-threaded form; the concurrency layer wraps it without touching it.
+**Status: correct, concurrent, tested, measured, and hardened.** 23 hand-written tests · 100k single-threaded fuzzed operations across 4 invariants with zero violations · a shrinker proven against an injected bug · 1.6 M operations through the queue across 1–16 producers · determinism verified in both directions · clean under ThreadSanitizer and AddressSanitizer · a completed profile → optimise → re-measure loop (allocation, not tree traversal, was the depth curve's cause) · a lock-free queue built, measured, and reverted on evidence · the benchmark instrument itself audited and rebuilt after it was found to be measuring load-dependent batch dilution rather than the system · the concurrent path shown to run in permanent backlog at any producer count, with bounded-vs-unbounded queue behaviour now characterised as a genuine floor/ceiling trade-off rather than a single number. The matching core is byte-identical to its single-threaded form; the concurrency layer wraps it without touching it.
 
 ---
 
 ## Session entries
+## Correctness sweep, benchmark instrument overhaul, and the concurrent-path saturation finding
+
+Two things happened this session: a full audit of `orderBook.hpp` against multi-translation-unit compilation (needed before the feed handler adds a second `.cpp`), and a rebuild of `concurrentBench`'s measurement machinery, which surfaced a finding about the writer that changes how every concurrent number in this project should be read.
+
+### Correctness and hygiene sweep
+
+Fixed with the feed handler in mind — everything here compiled fine in a single `.cpp` and would not have survived a second one.
+
+`memoryPool`'s copy constructor was deleted; copy assignment was not, since it's a separate special member function and user-declaring one does not suppress the other. `poolA = poolB` compiled and produced a `freeHead` pointing into a different pool's storage. Fixed by deleting assignment explicitly.
+
+`level::head` and `level::tail` had no default member initialisers. Every `level` in the book was safe by accident — `map::operator[]` value-initialises the mapped type, which zeroes pointers — but a `level` constructed any other way held garbage. Given default initialisers.
+
+`<chrono>` was used (`waitAndDrain`, `writerLoop`) but never included, relying on a transitive include from elsewhere in the header. `<any>` and `<unordered_set>` were included and unused. `<iostream>` was included for a single commented-out `std::cout`; removed, per the standing rule that a header shouldn't carry a static-initialiser-heavy dependency for dead code.
+
+`spinCount` and `producerOf` were non-inline definitions at namespace scope — an ODR violation waiting for a second translation unit. `spinCount` was a leftover from the reverted spin-before-sleep experiment and had no remaining reader; deleted. `producerOf` marked `inline`. Everything else in the file was already safe: `constexpr` constants have internal linkage by default, and functions defined inside a class body are implicitly inline — `producerOf` and `spinCount` were the only two exceptions.
+
+`waitAndDrain` returned `ssize_t`, a POSIX type with no standard-C++ guarantee and no code path that ever returns a negative value. Changed to `size_t`.
+
+`ConstLevelIterator::operator*` was missing a trailing `const`, which would have blocked dereferencing through a const-qualified iterator. `getOrderInfo` rebuilt an `Order` field-by-field rather than copying `*orderIt`, silently dropping any field added to `Order` later.
+
+Found during the pass, not in the original audit: `quantityAt` did a `find` followed by an `at` — two tree traversals where the README's cancel-traversal fix had already established the pattern of one `find` plus use-through-iterator. Fixed the same way. `checkFIFO`'s loop variable shadowed the `level` type; renamed to `lvl`, matching the convention already used in `totalBidVolume`/`totalAskVolume`. `validate` and `opposite` were not `const` despite only reading state.
+
+One design question resolved rather than coded: `modify`'s repost path (cancel then submit) never checks `submit`'s return value, so a hypothetical pool-exhaustion failure there would silently destroy a resting order while returning `true`. Traced whether this is reachable: `cancel` frees a slot before `submit` needs one, and the writer is single-threaded with nothing else able to allocate from the pool in between, so `rest`'s `allocate()` cannot return null on this path. Structurally unreachable, not merely unlikely — the same category of guarantee as the producer-partitioned id scheme, and a materially stronger position than the analogous `submit`-discards-`rest`-failure gap already recorded as a known limitation. Recorded as a one-line note rather than defended with code: modify's repost cannot exhaust the pool, because the preceding cancel already freed the slot it needs.
+
+Full suite, both sanitisers, and the fuzzer stayed green throughout.
+
+### Rebuilding `concurrentBench`'s measurement integrity
+
+`BenchContext` held three parallel vectors — `samples`, `lockAcquireNs`, `didSleep` — under-reserved and, for two of the three, not reserved at all. The reservation assumed every drain returned exactly `drainCap` items; in practice `waitAndDrain` returns as soon as the queue empties, so under load the true worst case is one item per drain, meaning up to `totalOps` samples rather than `totalOps / drainCap`. Every capacity crossing triggered a reallocate-and-copy inside the timed region — the same class of cost the pool optimisation exists to remove from the engine, now reintroduced by the harness measuring it.
+
+Fixed by collapsing the three parallel vectors into one `std::vector<BenchSample>`, each element holding `ns`, `ops`, `lockNs`, and `slept` together. This removes the reservation bug (one vector, reserved once at `totalOps`) and a latent one it hadn't been caught causing yet: parallel vectors can lose index correspondence the moment anything sorts one of them independently, which is exactly what the reporter was doing.
+
+`computeStats` sorted its input in place, silently destroying acquisition order in the caller's own vector. Any analysis needing time-ordering — a future check for drift over a run, for instance — would have been reading corrupted order without any signal that it happened. Fixed by taking a const reference and sorting a local copy.
+
+The mean was computed as an unweighted average of per-batch rates (`sum(ns/ops) / batchCount`), which over-weights small batches: a fixed per-drain overhead divided by a small `ops` produces a large per-op figure, and every batch counted equally regardless of how much work it represented. Replaced with a weighted mean: total `ns` across all batches divided by total `ops` across all batches.
+
+Percentiles had the same flaw one level further in. Sorting batches by per-op cost and indexing by batch position (`samples[batches * 99 / 100]`) means each *batch* counts once toward the percentile, regardless of whether it represents 1 operation or 256. Replaced with an operation-weighted walk: sort batches ascending by per-op cost, then walk forward accumulating `ops` until the running total crosses 50%, 99%, and 99.9% of total operations, recording the per-op cost of the batch where each threshold is crossed. A single large batch can cross more than one threshold in one step, so all unfilled thresholds are checked on every iteration rather than assuming one crossing per element.
+
+This is not a cosmetic fix. Batch size in `concurrentBench` is load-dependent, not fixed — it floats with however much accumulated in the queue between writer visits. Two runs at different drain caps produce different batch-size distributions, and the *old* percentile calculation was consequently not comparable across configurations at all: a drain-cap sweep from 64 to 1024 showed p99 apparently improving 6× (858 → 135 ns) purely from dilution, with p50 — the one figure batch size doesn't touch — moving in the *opposite* direction. Structurally the same failure as the earlier discarded drain-cap-sweep confound, recurring in a new place because the fix had not yet reached this benchmark. Batch-size mean/min/max are now printed alongside every result specifically so this is visible rather than something to remember.
+
+The reporter's label was stale (hardcoded "batches of 10" from an earlier configuration) and now states the actual drain cap. Migrated the prints to `std::print` for compile-time-checked format strings; confirmed it's available under this toolchain rather than assumed.
+
+### The saturation finding
+
+With the instrument fixed, the first clean measurement produced `batch size: min 64, max 64` — every single drain, across 50,000 of them, returned exactly the cap. Reducing to 2 producers: identical. Reducing to 1 producer: identical. The queue never once dropped below a full batch, at any producer count tested down to one.
+
+This means the writer is slower than a single producer doing nothing but push — not slower than eight or sixteen contending threads, slower than one thread whose entire job is lock, copy, notify, unlock. The asymmetry is structural rather than surprising once stated: a producer's work is a fixed, small, uncontended-until-the-mutex operation; the writer's work per operation is `submit` — walking the opposite side's map, potentially sweeping several price levels, allocating from the pool, mutating the cancel index, potentially erasing map nodes. One thread doing the expensive half will always be outrun by threads doing the cheap half.
+
+Consequence: every concurrent latency figure this project has produced describes the queue in permanent backlog, not the queue under representative load. The p50 figures are real — pop-plus-dispatch amortised over a always-available full batch — but the label "concurrent path latency" was broader than what was actually measured. The 1-in-320,000 sleep finding from the earlier diagnostic session is now explained rather than merely observed: the writer essentially never sleeps because there is, structurally, always a full batch waiting.
+
+Also follows: the queue's capacity had been sized to `totalOps` rounded up to a power of two specifically so it could never fill (`while(buffSize < totalOps) buffSize *= 2`), which meant reject-on-full — defended at length in the design writeup — had never once fired under measurement, and the buffer itself was ~50 MB at 400k operations, a first-touch cost sitting inside the unwarmed early samples.
+
+### Bounding the queue and pacing the producers
+
+Replaced the size-to-fit calculation with a fixed, caller-supplied capacity (still constrained to a power of two for the mask arithmetic). `pushAll` previously asserted every push succeeded; with a bounded queue under permanent backlog this fails immediately and correctly, since rejection is now the expected steady state rather than an edge case. Replaced the assert with a retry loop: spin up to 64 attempts (matching the figure already used in the existing backpressure test), then `std::this_thread::yield()` and reset, repeating until the push lands. Each producer thread accumulates its own retry count in a private slot (`std::vector<size_t>`, one per producer, indexed rather than shared) to avoid turning the retry counter itself into a contended atomic — the same reasoning that ruled out a shared `fetch_add` counter for producer ids.
+
+This has a real effect beyond satisfying the assert: a bounded queue with retry-and-yield turns the queue into a self-pacing rate limiter. A producer can only push once the writer has freed a slot, so the producer's effective rate becomes the writer's rate without any calibrated delay. This is the backpressure mechanism the design writeup describes in prose, now actually exercised for the first time.
+
+Measured at drain cap 64, comparing the old unbounded queue against a bounded one (4096 slots) with retry-and-yield, holding producer count fixed:
+
+At 2 producers: p50 rose 47 → 80 ns; p99 fell 438 → 210 ns; p99.9 fell 745 → 278 ns; max fell 1,281 → 750 ns. At 8 producers: p50 rose 50 → 112 ns; p99 was essentially unchanged, 858 → 920 ns; p99.9 rose 1,682 → 1,340 ns (still an improvement, but far smaller than at 2 producers); max fell 8,973 → 2,500 ns.
+
+Two-part explanation, not a contradiction. The median rises under bounding because producers can no longer finish early and leave the writer draining alone — with the old unbounded queue, producers raced ahead, joined, and most of the writer's work proceeded uncontended; with the bounded queue producers stay alive retrying for the full duration, so every drain now contends with live producer threads. The tail falls at low producer counts because `yield()` breaks the worst-case convoying pattern where producers hammer the mutex fast enough to starve the writer — but the effect degrades as producer count rises, because `yield()` is undirected: it tells the scheduler "run something else," and with 8 producers competing, "something else" is frequently another producer rather than the writer that would actually free slots. Retries-per-operation held at 2–3 across every configuration tested, suggesting the saturation level itself doesn't scale much with producer count — more producers share the same wait rather than compounding it.
+
+Reading taken from this: bounded and unbounded are not "correct" and "incorrect" configurations of the same measurement, they characterise genuinely different regimes, and reporting either alone would be a narrower claim than either supports. A higher floor with a lower ceiling is a real, statable trade-off, not a wash.
+
+### Still open
+
+Warm-up for `concurrentBench` is designed (a `warmupOps` parameter, branching to run a throwaway book-and-queue pair through the full path before constructing the real ones, discarding via `nullptr` bench context rather than clearing samples afterward) but not yet filled in with sizing or generation. Given the queue is now known to run permanently backlogged even at one producer, the warm-up queue's own capacity needs to be at least as large as the real run's footprint to actually fault in the pages that matter — worth doing once the real capacity is settled rather than before.
+
+The `yield()`-doesn't-target-the-writer limitation at high producer counts is a genuine finding about this pacing mechanism, not yet acted on. A targeted wake (a writer-specific condition a yielding producer could signal) would be solving a benchmark-fidelity problem rather than an engine one, and hasn't been decided as worth building.
+
+The response path — currently unbuilt, designed in the README as per-producer SPSC queues routed by id high bits — was reconsidered in light of this session's finding. The writer is now known to be the binding constraint at any producer count, so anything added to its per-operation work (dispatching fills into N outbound queues) will lower the saturation ceiling further; building it needs a before/after re-measurement against the now-fixed instrument, not a single after-the-fact number. Separately, the original per-producer-SPSC design was reasoned out when the only anticipated consumer was a producer wanting its own fills back; it may be worth revisiting against a single sequenced output stream — one writer, one append-only stream of fills, multiple independent readers — which is closer to how a real exchange separates the matching core from market-data and drop-copy fan-out, and is also the shape the metrics-egress problem for the planned feed-handler and market-maker work will need regardless.
 
 Profiling — adjudicating the pre-registered hypotheses
 

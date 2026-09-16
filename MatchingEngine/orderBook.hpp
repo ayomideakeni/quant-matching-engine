@@ -4,24 +4,20 @@
 #include <list>
 #include <vector>
 #include <cstdint>
-#include <iostream>
 #include <algorithm>
 #include <optional>
-#include <any>
 #include <mutex>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
-#include <unordered_set>
 #include <utility>
+#include <chrono>
 #include "orderClass.hpp"
 
 using Price = int64_t;
 using Quantity = int64_t;
 using Id = int64_t;
-using orderIterator = std::list<Order>::iterator;
 
-size_t spinCount = 750;
 
 struct memoryPool{
     std::vector<Order> slots;
@@ -54,6 +50,7 @@ struct memoryPool{
     // never resize after construction
 
     memoryPool(const memoryPool&) = delete;
+    memoryPool& operator=(const memoryPool&) = delete;
     
 
  
@@ -78,7 +75,7 @@ struct LevelIterator{
 struct ConstLevelIterator{
     const Order* current;
 
-    const Order& operator*() {
+    const Order& operator*() const{
         return *current;
     }
 
@@ -107,14 +104,14 @@ Id nextId(){
 }
 };
 
-int producerOf(Id id){
+inline int producerOf(Id id){
     return static_cast<int>(id >> producerShift);
 }
 
 
 struct level{
-    Order* head;
-    Order* tail;
+    Order* head = nullptr;
+    Order* tail = nullptr;
 
     LevelIterator begin(){return {head};}
     LevelIterator end(){return {nullptr};}
@@ -183,7 +180,7 @@ public:
         }
     }
 
-    Side opposite(Side side){
+    Side opposite(Side side) const{
         if(side == Side::Buy){
             return Side::Sell;
         }else{
@@ -195,11 +192,11 @@ public:
         auto it = cancelIndex.find(id);
         if (it == cancelIndex.end()) return std::nullopt;
         auto orderIt = it->second;
-        return Order{orderIt->side, orderIt->type, orderIt->price, orderIt->quantity, id, orderIt->seq};
+        return *orderIt;
     }
 
 
-    bool validate(const Order& o){
+    bool validate(const Order& o) const{
         if(contains(o.id)) return false;
         else if(o.quantity <= 0) return false;
         else if(o.type == Type::Limit){
@@ -349,9 +346,9 @@ public:
     int64_t quantityAt(Side side, Price price) const{
         int64_t levelQty = 0;
         if(side == Side::Buy){
-            if(bids.find(price) != bids.end()){
-             auto const& priceLevel = bids.at(price);
-             for(const auto& i : priceLevel){
+            auto const priceLevel = bids.find(price);
+            if(priceLevel != bids.end()){
+             for(const auto& i : priceLevel->second){
                 levelQty += i.quantity;
              }
             }
@@ -468,9 +465,9 @@ public:
    }
 
    bool checkFIFO() const{
-    for(const auto& [price, level] : bids){
+    for(const auto& [price, lvl] : bids){
         int64_t lastSeq = -1;
-        for(const auto& order : level){
+        for(const auto& order : lvl){
             if(lastSeq != -1 && order.seq < lastSeq){
                 return false;
             }
@@ -519,89 +516,83 @@ struct Request{
 struct RingBuffer {
 private:
     size_t capacity;
+    size_t mask;
     std::vector<Request> buffer;
+    
     alignas(64) std::atomic<size_t> head{0};
     alignas(64) std::atomic<size_t> tail{0};
-    std::atomic<size_t> count = 0;
+    alignas(64) std::atomic<size_t> count{0}; // Isolated onto its own L1 cache line
+    
     alignas(64) std::mutex m;
     std::condition_variable convar;
     bool stopping = false;
 
-    bool isFull() const {
-        if (count == capacity) return true;
-        return false;
-    }
-    bool isEmpty() const {
-        if (count == 0) return true;
-        return false;
-    }
+    bool isFull() const { return count == capacity; }
+    bool isEmpty() const { return count == 0; }
+    
     Request takeRequestLocked() {
         auto request = buffer[head];
-        head = (head + 1) % capacity;
+        head = (head + 1) & mask; // Single-cycle bitwise AND
         --count;
         return request;
     }
+    
 public:
-
     bool push(const Request& r) {
         std::unique_lock<std::mutex> lock(m);
         if (isFull()) return false;
-        else {
-            buffer[tail] = r;
-            tail = (tail + 1) % capacity;
-            ++count;
-            convar.notify_all();
-            return true;
-        }
+        
+        buffer[tail] = r;
+        tail = (tail + 1) & mask; // Single-cycle bitwise AND
+        ++count;
+        convar.notify_one(); // Targeted wakeup prevents thundering herd
+        return true;
     }
 
     std::optional<Request> pop() {
         std::unique_lock<std::mutex> lock(m);
         if (isEmpty()) return std::nullopt;
-        else {
-            return takeRequestLocked();
-        }
+        return takeRequestLocked();
     }
 
     std::optional<Request> waitAndPop() {
         std::unique_lock<std::mutex> lock(m);
         convar.wait(lock, [this]{ return count > 0 || stopping; });
         if (stopping && isEmpty()) return std::nullopt;
-        else {
-            return takeRequestLocked();
+        
+        return takeRequestLocked();
+    }
+
+    size_t waitAndDrain(std::vector<Request>& out, size_t maxItems, bool* didSleep = nullptr, double* lockNs = nullptr) {
+        size_t drained = 0;
+
+        auto lockStart = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(m);
+        auto lockEnd = std::chrono::steady_clock::now();
+
+        if (lockNs) {
+            *lockNs = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count()
+            );
         }
-    }
 
-    ssize_t waitAndDrain(std::vector<Request>& out, size_t maxItems, bool* didSleep = nullptr, double* lockNs = nullptr) {
-    size_t drained = 0;
+        if (didSleep) {
+            *didSleep = (count == 0 && !stopping);
+        }
 
-    auto lockStart = std::chrono::steady_clock::now();
-    std::unique_lock<std::mutex> lock(m);
-    auto lockEnd = std::chrono::steady_clock::now();
+        convar.wait(lock, [this]{ return count > 0 || stopping; });
 
-    if (lockNs) {
-        *lockNs = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count()
-        );
-    }
-
-    if (didSleep) {
-        *didSleep = (count == 0 && !stopping);
-    }
-
-    convar.wait(lock, [this]{ return count > 0 || stopping; });
-
-    if (stopping && isEmpty()) return drained;
-    else {
         out.clear();
+
+        if (stopping && isEmpty()) return drained;
+        
+        
         while (count > 0 && drained < maxItems) {
-            auto req = takeRequestLocked();
-            out.push_back(std::move(req));
+            out.push_back(takeRequestLocked());
             ++drained;
         }
+        return drained;
     }
-    return drained;
-}
 
     void shutdown() {
         std::unique_lock<std::mutex> lock(m);
@@ -610,7 +601,7 @@ public:
     }
 
     RingBuffer(size_t capacity)
-        : capacity(capacity), buffer(capacity) {}
+        : capacity(capacity), mask(capacity - 1), buffer(capacity) {}
 };
 
 enum class vio {
@@ -628,12 +619,20 @@ struct WriterContext {
     std::atomic<size_t> processed{0};
 };
 
+struct BenchSample{
+    double ns;
+    size_t ops;
+    double lockNs;
+    bool slept;
+
+    double opMean() const{
+        return ns / ops;
+    }
+};
+
 struct BenchContext {
-    std::vector<double> samples;
-    std::vector<double> lockAcquireNs; // Time spent blocked attempting to acquire std::mutex (per batch)
-    std::vector<double> totalBatchNs;  // Total time including lock acquisition + drain + processing (per op)
-    std::vector<bool> didSleep;
-    size_t drainCap = 64;
+   std::vector<BenchSample> samples;
+   size_t drainCap = 64;
 };
 
 bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQuantity, Quantity tradedQty, Type orderType, bool rejected) {
@@ -721,9 +720,7 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
             auto end = std::chrono::steady_clock::now();
             auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
-            btx->samples.push_back(static_cast<double>(ns) / static_cast<double>(n));
-            btx->didSleep.push_back(slept);
-            btx->lockAcquireNs.push_back(lockNs);
+            btx->samples.push_back({static_cast<double>(ns), n, lockNs,slept});
         }
     } else {
         drained.reserve(64);

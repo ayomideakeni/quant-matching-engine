@@ -6,44 +6,87 @@
 #include <random>
 #include <chrono>
 #include <cassert>
+#include <unordered_set>
 
 //enum class OpType { Submit, Cancel, Modify};
 struct Stats {
     double mean = 0.0, p50 = 0.0, p99 = 0.0, p999 = 0.0, max = 0.0;
-    size_t n = 0;
+    size_t batches = 0;
+    size_t totalOps = 0;
+    double batchMean = 0.0;
+    size_t batchMax = 0;
+    size_t batchMin = SIZE_MAX;
+    double totalNs = 0.0;
 };
 
-Stats computeStats(std::vector<double>& samples) {
+Stats computeStats(const std::vector<BenchSample>&  original) {
     Stats st;
+    auto samples = original;
     if (samples.empty()) return st;
 
-    std::sort(samples.begin(), samples.end());
-    const size_t n = samples.size();
 
-    st.n    = n;
-    st.p50  = samples[n * 50 / 100];
-    st.p99  = samples[n * 99 / 100];
-    st.p999 = samples[n * 999 / 1000];
-    st.max  = samples.back();
+    
+    for (const auto& s : samples){
+        st.totalNs += s.ns;
+        st.totalOps += s.ops;
+        st.batchMin = std::min(st.batchMin, s.ops);
+        st.batchMax = std::max(st.batchMax, s.ops);
+        
+    }
+    st.batches = samples.size();
+    st.mean = st.totalNs /  static_cast<double>(st.totalOps);
 
-    double sum = 0.0;
-    for (double s : samples) sum += s;
-    st.mean = sum / static_cast<double>(n);
+    st.batchMean = static_cast<double>(st.totalOps) / static_cast<double>(st.batches);
+
+    std::sort(samples.begin(), samples.end(), [](const BenchSample& a, const BenchSample& b){return a.opMean() < b.opMean();});
+    
+    size_t opsSeen = 0;
+    size_t p50 = (st.totalOps * 50 / 100);
+    size_t p99 = (st.totalOps * 99 / 100);
+    size_t p999 = (st.totalOps * 999 / 1000);
+    bool rec50 = false;
+    bool rec99 = false;
+    bool rec999 = false;
+
+    for(const auto& s : samples){
+        opsSeen += s.ops;
+        if(!rec50 && opsSeen >= p50){
+            st.p50 = s.opMean();
+            rec50 = true;
+        }
+        if(!rec99 && opsSeen >= p99){
+            st.p99 = s.opMean();
+            rec99 = true;
+        }
+        if(!rec999 && opsSeen >= p999){
+            st.p999 = s.opMean();
+            rec999 = true;
+        }
+    }
+    st.max = samples.back().opMean();
+
     return st;
 }
 
 // Kept for single-benchmark runs; the sweep uses the table printer instead.
-void reportPercentiles(const std::string& label, std::vector<double>& samples) {
+void reportPercentiles(const std::string& label,
+                       const std::vector<BenchSample>& samples,
+                       size_t drainCap) {
     Stats st = computeStats(samples);
-    if (st.n == 0) return;
-    std::cout << "-----------------------------------------------------\n";
-    std::cout << label << " (Samples: " << st.n << " batches)\n";
-    std::cout << "  Mean  : " << st.mean << " ns/op\n";
-    std::cout << "  p50   : " << st.p50  << " ns/op\n";
-    std::cout << "  p99   : " << st.p99  << " ns/op\n";
-    std::cout << "  p99.9 : " << st.p999 << " ns/op\n";
-    std::cout << "  Max   : " << st.max  << " ns/op\n";
-    std::cout << "-----------------------------------------------------\n";
+    if (st.batches == 0) return;
+
+    std::print("-----------------------------------------------------\n");
+    std::print("{} (drain cap {})\n", label, drainCap);
+    std::print("  Batches   : {}\n", st.batches);
+    std::print("  Total ops : {}\n", st.totalOps);
+    std::print("  Batch size: mean {:.1f}, min {}, max {}\n",
+               st.batchMean, st.batchMin, st.batchMax);
+    std::print("  Mean      : {:.3f} ns/op\n", st.mean);
+    std::print("  p50       : {:.3f} ns/op\n", st.p50);
+    std::print("  p99       : {:.3f} ns/op\n", st.p99);
+    std::print("  p99.9     : {:.3f} ns/op\n", st.p999);
+    std::print("  Max       : {:.3f} ns/op\n", st.max);
+    std::print("-----------------------------------------------------\n");
 }
 
 struct LoggedOp{
@@ -772,11 +815,22 @@ void testRingBufferConcurrentMatching() {
     assert(totalRestingQuantity == totalExpectedOrders);
 }
 
-static void pushAll(RingBuffer& queue, const std::vector<Request>& stream){
+static void pushAll(RingBuffer& queue, const std::vector<Request>& stream, size_t& retryCount){
     int pushCount = 0;
+    size_t spins = 0;
     for(int i = 0; i < stream.size(); ++i){
-        bool pushed = queue.push(stream[i]);
-        assert(pushed);
+        while(true){
+            bool pushed = queue.push(stream[i]);
+            if(pushed) break;
+            
+            retryCount++;
+            spins++;
+            if(spins == 64){
+                std::this_thread::yield();
+                spins = 0;
+            }
+        }
+        
         ++pushCount;
     }
     //std::println("Push Count: {}", pushCount);
@@ -806,10 +860,16 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     ctx.captured.reserve(capSize);
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx, nullptr);
 
+    std::vector<size_t> retryCounts(producerCount, 0);
+
     std::vector<std::thread> threads;
     for(int i = 0; i < producerCount; ++i){
-        threads.emplace_back(pushAll, std::ref(queue), std::ref(streams[i]));
+        threads.emplace_back(pushAll, std::ref(queue), std::ref(streams[i]), std::ref(retryCounts[i]));
     }
+
+    size_t totalRetries = 0;
+    for(auto r : retryCounts) totalRetries += r;
+
     for(auto& t : threads) t.join();
     queue.shutdown();
     writer.join();
@@ -840,15 +900,22 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
 }
 
 
-void concurrentBench(int producerCount, int opsPerProd, int draincap){
+void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t warmupOps = 0,size_t buffSize = 4096){
     generator cGen;
     std::vector<std::vector<Request>> streams;
     size_t totalOps = (producerCount * opsPerProd);
     BenchContext btx;
     btx.drainCap = draincap;
-    btx.samples.reserve(totalOps / draincap + 16);
-    size_t buffSize = 1;
+    btx.samples.reserve(totalOps);
+    
+    
 
+    if(warmupOps > 0){
+        generator warmGen;
+        OrderBook warmBook;
+        RingBuffer warmQueue(buffSize);
+        std::thread writer(writerLoop, std::ref(warmQueue), std::ref(warmBook), nullptr, nullptr);
+    }
 
     for(int i = 0; i < producerCount; ++i){
         producer prod(i);
@@ -856,24 +923,28 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap){
        streams.push_back(std::move(prodReqs));
     }
     
-        while(buffSize < totalOps){
-            buffSize *= 2;
-        }
     
     
     OrderBook conBook;
     RingBuffer queue(buffSize);
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
 
+    std::vector<size_t> retryCounts(producerCount, 0);
+
     std::vector<std::thread> threads;
     for(int i = 0; i < producerCount; ++i){
-        threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]));
+        threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]), std::ref(retryCounts[i]));
     }
     for(auto& t : threads) t.join();
     queue.shutdown();
     writer.join();
 
-    reportPercentiles("Bench Percentiles",btx.samples);
+    size_t totalRetries = 0;
+    for(auto r : retryCounts) totalRetries += r;
+
+    reportPercentiles("Bench Percentiles",btx.samples, draincap);
+    std::println("Total Retries {}", totalRetries);
+    std::println("Retries per op {}", totalRetries / totalOps);
 
   
     return;
@@ -1339,7 +1410,7 @@ void runRingBufferTests(){
 
 
 
-#ifndef TESTS_NO_MAIN
+//ifndef TESTS_NO_MAIN
 
 
 int main(){
@@ -1646,7 +1717,7 @@ int main(){
     for (int i = 0; i < 20; ++i) {
         generator gen;
         OrderBook book;
-       t.concurrentBench(16, 200000, 10);
+       t.concurrentBench(8, 400000, 64);
        //t.generateAndExecute(book, gen, 400000);
     }
    
@@ -1655,4 +1726,4 @@ int main(){
  
         return 0;
 }
-#endif
+//#endif
