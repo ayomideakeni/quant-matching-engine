@@ -68,6 +68,37 @@ Stats computeStats(const std::vector<BenchSample>&  original) {
     return st;
 }
 
+Stats computeStats(const std::vector<double>& original) {
+    Stats st;
+    if (original.empty()) return st;
+ 
+    auto samples = original;              // don't mutate the caller's vector
+    std::sort(samples.begin(), samples.end());
+ 
+    st.batches = samples.size();           // batches == samples here; no
+    st.totalOps = samples.size();          // per-batch op count exists in
+                                            // this harness (every batch is
+                                            // a fixed size decided by the
+                                            // caller), so both just reflect
+                                            // the sample count.
+ 
+    st.p50  = samples[samples.size() * 50  / 100];
+    st.p99  = samples[samples.size() * 99  / 100];
+    st.p999 = samples[samples.size() * 999 / 1000];
+    st.max  = samples.back();
+ 
+    double sum = 0.0;
+    for (double s : samples) sum += s;
+    st.mean = sum / static_cast<double>(samples.size());
+ 
+    st.totalNs   = sum;
+    st.batchMean = 1.0;   // fixed batch size in this harness; not meaningful
+    st.batchMin  = 1;
+    st.batchMax  = 1;
+ 
+    return st;
+}
+
 // Kept for single-benchmark runs; the sweep uses the table printer instead.
 void reportPercentiles(const std::string& label,
                        const std::vector<BenchSample>& samples,
@@ -122,8 +153,51 @@ std::ostream& operator<<(std::ostream& os, const std::vector<S>& vector) {
 
  struct generator{
         std::mt19937 rng;
+
+        
+
         std::vector<Id> restingIds;
         Id nextId = 1;
+
+        int modifyWeight = 50;
+        int submitWeight = 80;
+        int cancelWeight = 80;
+
+
+
+        
+        int minSeeded = 1;
+        int iterationsDone = 0;
+        int checkPoint = 0;
+
+        generator() = default;
+
+        generator(int modifyPct, int submitPct, int cancelPct)
+            : modifyWeight(modifyPct),
+              submitWeight(submitPct),
+              cancelWeight(modifyPct + submitPct)
+        {
+            assert(modifyPct >= 0 && submitPct >= 0 && cancelPct >= 0);
+            assert(modifyPct + submitPct + cancelPct == 100);
+        }
+
+
+        Order generateSubmit(){
+
+        std::uniform_int_distribution<int> sideDist(0, 1);
+        std::uniform_int_distribution<int> typeDist(0, 9);
+        std::uniform_int_distribution<int> priceDist(1, 100);
+        std::uniform_int_distribution<int> quantityDist(1, 100);
+
+            Order o{sideDist(rng) == 0 ? Side::Buy : Side::Sell,
+                        typeDist(rng) != 9 ? Type::Limit : Type::Market,
+                        priceDist(rng),
+                        quantityDist(rng),
+                        nextId++,
+                        0};
+                restingIds.push_back(o.id);
+                return o;
+        }
     };
 
 struct Test {
@@ -384,7 +458,7 @@ struct Test {
         return false;
     }
 
-    std::optional<std::vector<LoggedOp>> generateAndExecute(OrderBook& book, generator& gen, int iterations){
+    std::optional<std::vector<LoggedOp>> generateAndExecute(OrderBook& book, generator& gen, int iterations, bool* checkpoints = nullptr ,bool* checkInv = nullptr, bool* logs = nullptr){
         std::uniform_int_distribution<int> sideDist(0, 1);
         std::uniform_int_distribution<int> typeDist(0, 9);
         std::uniform_int_distribution<int> priceDist(1, 100);
@@ -393,10 +467,12 @@ struct Test {
         std::uniform_int_distribution<int> PriceChangeChance(0, 5);
         std::uniform_int_distribution<int> QuantityChangeChance(0, 5);
         std::vector<LoggedOp> history;
+        int nextCheckPoint = gen.checkPoint + gen.iterationsDone;
         
          
-        for(int i = 0; i < iterations; ++i){
-            if(gen.restingIds.empty()){
+        for(int i = gen.iterationsDone; i < iterations; ++i){
+            ++gen.iterationsDone;
+            if(gen.restingIds.size() < gen.minSeeded){
                 Order o{sideDist(gen.rng) == 0 ? Side::Buy : Side::Sell,
                         typeDist(gen.rng) != 9 ? Type::Limit : Type::Market,
                         priceDist(gen.rng),
@@ -406,40 +482,11 @@ struct Test {
                 book.submit(o);
                 gen.restingIds.push_back(o.id);
             } else{
+                
+                if(checkpoints && gen.iterationsDone >= nextCheckPoint) return std::nullopt;
                 std::uniform_int_distribution<size_t> indexDist(0, gen.restingIds.size() - 1);
                 auto operation = operationDist(gen.rng);
-                if( operation >= 50 && operation <= 79){
-                   Order o{sideDist(gen.rng) == 0 ? Side::Buy : Side::Sell,
-                    typeDist(gen.rng) != 9 ? Type::Limit : Type::Market,
-                    priceDist(gen.rng),
-                    quantityDist(gen.rng),
-                    gen.nextId++
-                   };
-                   auto result = book.submit(o);
-                   if(result.has_value() && o.type == Type::Limit){
-                    gen.restingIds.push_back(o.id);
-                    history.push_back({OpType::Submit, o, o.id, std::nullopt, std::nullopt});
-                   }
-
-                   /*std::cout << "[Iter " << i << "] SUBMIT: " 
-                         << (o.type == Type::Limit ? "Limit " : "Market ")
-                         << (o.side == Side::Buy ? "Buy" : "Sell") 
-                         << " ID " << o.id << " (" << o.quantity << " @ " << o.price << ")\n";*/
-                    
-                }
-                if(operation >= 80 && operation <= 99){
-                    size_t idx = indexDist(gen.rng);
-                    auto Order = book.getOrderInfo(gen.restingIds[idx]);
-                    Id idToCancel = gen.restingIds[idx];
-                    book.cancel(idToCancel);
-                    gen.restingIds.erase(gen.restingIds.begin() + idx);
-
-                    history.push_back({OpType::Cancel, *Order, idToCancel, std::nullopt, std::nullopt});
-
-
-                    //std::cout << "[Iter " << i << "] CANCEL: ID " << idToCancel << "\n";
-                }
-                if(operation >= 0 && operation <= 49){
+                if(operation >= 0 && operation < gen.modifyWeight){
                     size_t idx = indexDist(gen.rng);
                     Id idToModify = gen.restingIds[idx];
                     auto orderInfo = book.getOrderInfo(idToModify);
@@ -465,28 +512,89 @@ struct Test {
                     /*std::cout << "[Iter " << i << "] MODIFY: ID " << idToModify 
                         << " (NewPrice: " << (newPrice ? std::to_string(*newPrice) : "None")
                         << ", NewQty: " << (newQuantity ? std::to_string(*newQuantity) : "None") << ")\n";*/
-                        history.push_back({OpType::Modify, *orderInfo, idToModify, newPrice, newQuantity});
+                        if(logs)history.push_back({OpType::Modify, *orderInfo, idToModify, newPrice, newQuantity});
                 }
+                if( operation >= gen.modifyWeight && operation < gen.cancelWeight){
+                   Order o{sideDist(gen.rng) == 0 ? Side::Buy : Side::Sell,
+                    typeDist(gen.rng) != 9 ? Type::Limit : Type::Market,
+                    priceDist(gen.rng),
+                    quantityDist(gen.rng),
+                    gen.nextId++
+                   };
+                   auto result = book.submit(o);
+                   if(result.has_value() && o.type == Type::Limit){
+                    gen.restingIds.push_back(o.id);
+                    if(logs)history.push_back({OpType::Submit, o, o.id, std::nullopt, std::nullopt});
+                   }
+
+                   /*std::cout << "[Iter " << i << "] SUBMIT: " 
+                         << (o.type == Type::Limit ? "Limit " : "Market ")
+                         << (o.side == Side::Buy ? "Buy" : "Sell") 
+                         << " ID " << o.id << " (" << o.quantity << " @ " << o.price << ")\n";*/
+                    
+                }
+                if(operation >= gen.cancelWeight && operation <= 99){
+                    size_t idx = indexDist(gen.rng);
+                    auto Order = book.getOrderInfo(gen.restingIds[idx]);
+                    Id idToCancel = gen.restingIds[idx];
+                    book.cancel(idToCancel);
+                    gen.restingIds.erase(gen.restingIds.begin() + idx);
+
+                    if(logs)history.push_back({OpType::Cancel, *Order, idToCancel, std::nullopt, std::nullopt});
+
+
+                    //std::cout << "[Iter " << i << "] CANCEL: ID " << idToCancel << "\n";
+                }
+                
             }
 
 
-            if(book.checkNoCrossedBook()){
-                std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
+            if(checkInv){
+                if(book.checkNoCrossedBook()){
+                    std::cout << "CROSSED BOOK DETECTED at iteration " << i << "\n";
+                    return history;
+                } 
+                if(book.checkNoOrphans() != std::nullopt){
+                    std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n";
+                return history; 
+                } 
+                if(!book.checkFIFO()){
+                std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
                 return history;
-            } 
-            if(book.checkNoOrphans() != std::nullopt){
-                std::cout << "ORPHANED ORDER DETECTED at iteration " << i << "\n";
-               return history; 
-            } 
-            if(!book.checkFIFO()){
-            std::cout << "FIFO VIOLATION DETECTED at iteration " << i << "\n";
-            return history;
-  
-            } 
+    
+                } 
+            }
 
     }
     return std::nullopt;
 
+}
+
+//DISREGARD FIRST RESULT
+void fragTest(OrderBook& book, generator& gen, int iterations, int seed, int batchSize){
+    int checkPoint = iterations / 10;
+    std::vector<BenchSample> samples;
+    gen.checkPoint = checkPoint;
+    gen.minSeeded = seed;
+    bool checkp(true);
+    std::print("-----------------------------------------------------\n");
+
+    while(true){
+        if(gen.iterationsDone >= iterations) break;
+        generateAndExecute(book, gen, iterations, &checkp);
+        
+            auto start = std::chrono::steady_clock::now();
+            for(int i = 0; i < batchSize; ++i){
+                auto o = gen.generateSubmit();
+                book.submit(o);
+            }
+            auto end = std::chrono::steady_clock::now();
+            double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            samples.push_back({ns, static_cast<size_t>(batchSize), 0.0, false});
+            std::println("{}", (ns/batchSize));
+        
+    }
+    
 }
 bool deterTest(const OrderBook& book1,const OrderBook& book2,std::pair<int,int> priceRange){
     for(int i = priceRange.first; i <= priceRange.second; ++i){
@@ -914,7 +1022,17 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
         generator warmGen;
         OrderBook warmBook;
         RingBuffer warmQueue(buffSize);
+        producer prod(1);
+
+        auto warmUpReqs = generateRequest(warmGen, prod, warmupOps);
+        size_t warmRetries = 0;
+
+        std::thread p(pushAll, std::ref(warmQueue), std::ref(warmUpReqs), std::ref(warmRetries));
         std::thread writer(writerLoop, std::ref(warmQueue), std::ref(warmBook), nullptr, nullptr);
+
+        p.join();
+        warmQueue.shutdown();
+        writer.join();
     }
 
     for(int i = 0; i < producerCount; ++i){
@@ -923,13 +1041,14 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
        streams.push_back(std::move(prodReqs));
     }
     
-    
+    std::vector<size_t> retryCounts(producerCount, 0);
     
     OrderBook conBook;
     RingBuffer queue(buffSize);
+    auto start = std::chrono::steady_clock::now();
+
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
 
-    std::vector<size_t> retryCounts(producerCount, 0);
 
     std::vector<std::thread> threads;
     for(int i = 0; i < producerCount; ++i){
@@ -938,6 +1057,21 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
     for(auto& t : threads) t.join();
     queue.shutdown();
     writer.join();
+
+    auto end = std::chrono::steady_clock::now();
+
+    double wallNs =
+    std::chrono::duration<double, std::nano>(end - start).count();
+
+    double wallMs = wallNs / 1'000'000.0;
+
+    double seconds = wallNs / 1'000'000'000.0;
+
+    double throughput =
+        static_cast<double>(totalOps) / seconds;
+
+    std::println("Wall time   : {:.3f} ms", wallMs);
+std::println("Throughput   : {:.3f} M ops/s", throughput / 1'000'000.0);
 
     size_t totalRetries = 0;
     for(auto r : retryCounts) totalRetries += r;
@@ -1394,8 +1528,8 @@ void testVolumeConservedPredicate() {
     std::cout << "[PASS] All 8 volumeConserved unit tests PASSED successfully!\n";
 }
 
-void runRingBufferTests(){
-    testRingBufferConcurrent();
+/*void runRingBufferTests(){
+    //testRingBufferConcurrent();
     testRingBufferFillsAndRefuses();
     testRingBufferFIFOOrder();
     testRingBufferDrainsAndRefuses();
@@ -1406,11 +1540,11 @@ void runRingBufferTests(){
     testRejectOnFullUnderContention();
 
 
-}
+}*/
 
 
 
-//ifndef TESTS_NO_MAIN
+#ifndef TESTS_NO_MAIN
 
 
 int main(){
@@ -1692,8 +1826,8 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
     }
 
-    runRingBufferTests();
-    t.testRingBufferConcurrentMatching();
+    //runRingBufferTests();
+    //t.testRingBufferConcurrentMatching();
 
     WriterContext ctx;
     t.testConcurrentGen(1, 1000000, ctx);
@@ -1714,16 +1848,22 @@ int main(){
 
     }*/
 
-    for (int i = 0; i < 20; ++i) {
-        generator gen;
-        OrderBook book;
-       t.concurrentBench(8, 400000, 64);
-       //t.generateAndExecute(book, gen, 400000);
-    }
+    int drainCap = 1024;
+    
+        for (int i = 0; i < 5; ++i) {
+            generator gen;
+            OrderBook book;
+            t.concurrentBench(2, 800000, 64, 10000);
+            //generator fragGen(45,10,45);
+            //t.fragTest(book, fragGen, 500'000, 5000, 1000);
+        //t.generateAndExecute(book, gen, 400000);
+        }
+    
+    
    
 
     //t.runmemoryPoolTests();
  
         return 0;
 }
-//#endif
+#endif

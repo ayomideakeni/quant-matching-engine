@@ -12,6 +12,9 @@
 #include <condition_variable>
 #include <utility>
 #include <chrono>
+#include "boost/unordered/unordered_flat_map.hpp"
+#include "boost/container/flat_map.hpp"
+#include "absl/container/btree_map.h"
 #include "orderClass.hpp"
 
 using Price = int64_t;
@@ -154,31 +157,39 @@ struct level{
 class OrderBook{
 private:
     memoryPool pool;
-    std::map<Price, level> asks;
-    std::map<Price, level> bids;
-    std::unordered_map<Id,Order*> cancelIndex;
+    //std::map<Price, level> asks;
+    //std::map<Price, level> bids;
+    absl::btree_map<Price, level> asks;
+    absl::btree_map<Price, level> bids;
+    boost::unordered_flat_map<Id,Order*> cancelIndex;
+    //std::unordered_map<Id, Order*> cancelIndex;
     int64_t nextSeq = 0;
+    
 
     
 
 public:
 
-    OrderBook(size_t poolSize = 100000): pool(poolSize) {}
+    OrderBook(size_t poolSize = 100000): pool(poolSize),  cancelIndex(poolSize) {}
+    
+    absl::btree_map<Price, level>& getMap(Side side){
+        if(side == Side::Buy){
+            return bids;
+        }else{
+            return asks;
+        }
+    }
+    const absl::btree_map<Price, level>& getMap(Side side) const{
+        if(side == Side::Buy){
+            return bids;
+        }else{
+            return asks;
+        }
+    }
 
-    std::map<Price, level>& getMap(Side side){
-        if(side == Side::Buy){
-            return bids;
-        }else{
-            return asks;
-        }
-    }
-    const std::map<Price, level>& getMap(Side side) const{
-        if(side == Side::Buy){
-            return bids;
-        }else{
-            return asks;
-        }
-    }
+
+
+
 
     Side opposite(Side side) const{
         if(side == Side::Buy){
@@ -229,7 +240,7 @@ public:
     }
 
     
-        void restInto(std::map<Price, level>& map, Order* o){
+        void restInto(absl::btree_map<Price, level>& map, Order* o){
             map[o->price].linkBack(o);
     }
 
@@ -493,7 +504,7 @@ std::vector<Id> idsAt(Side s, Price p) const{
     auto& map = getMap(s);
     auto priceLevel = map.find(p);
     if(priceLevel != map.end()){
-        for(auto o : priceLevel->second){
+        for(auto& o : priceLevel->second){
         ids.push_back(o.id);
     }
     }
@@ -519,9 +530,9 @@ private:
     size_t mask;
     std::vector<Request> buffer;
     
-    alignas(64) std::atomic<size_t> head{0};
-    alignas(64) std::atomic<size_t> tail{0};
-    alignas(64) std::atomic<size_t> count{0}; // Isolated onto its own L1 cache line
+    alignas(64) size_t head{0};
+    alignas(64) size_t tail{0};
+    alignas(64) size_t count{0}; // Isolated onto its own L1 cache line
     
     alignas(64) std::mutex m;
     std::condition_variable convar;
@@ -545,6 +556,7 @@ public:
         buffer[tail] = r;
         tail = (tail + 1) & mask; // Single-cycle bitwise AND
         ++count;
+        lock.unlock();
         convar.notify_one(); // Targeted wakeup prevents thundering herd
         return true;
     }

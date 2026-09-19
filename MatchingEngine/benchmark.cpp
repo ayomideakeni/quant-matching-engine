@@ -171,6 +171,47 @@ Stats benchmarkSubmitResting(generator& gen, int levels, int iterations,
     return computeStats(samples);
 }
 
+void processWarmup(generator& gen, int iterations) {
+    const int peak   = iterations * 2;
+    const int levels = 10'000;   // widest tree the sweep will build
+
+    for (int pass = 0; pass < 2; ++pass) {
+        OrderBook book;
+        std::vector<Id> ids;
+        ids.reserve(peak);
+
+        // Resting inserts across a wide band: grows the arena to peak size
+        // and populates the cancel index to peak occupancy.
+        for (int i = 0; i < peak; ++i) {
+            Order o{Side::Buy, Type::Limit, spreadPrice(i, levels), 100, gen.nextId++, 0};
+            book.rest(o);
+            ids.push_back(o.id);
+        }
+
+        // Touch each hot path so its code and branch history are warm too.
+        const int slice = peak / 8;
+        for (int i = 0; i < slice; ++i) {
+            book.modify(ids[i], std::nullopt, 50);
+        }
+        for (int i = slice; i < 2 * slice; ++i) {
+            book.modify(ids[i], scatterPrice(i, levels), std::nullopt);
+        }
+        for (int i = 2 * slice; i < 3 * slice; ++i) {
+            book.cancel(ids[i]);
+        }
+
+        // Crossing path.
+        for (int i = 0; i < slice; ++i) {
+            Order sell{Side::Sell, Type::Limit, spreadPrice(i, levels), 1, gen.nextId++, 0};
+            book.submit(sell);
+        }
+
+        // Book destroyed here: frees everything back to the allocator, which
+        // is the state the sweep's first trial will actually start from.
+    }
+}
+
+
 // ---------------------------------------------------------------------
 //  2. Submit — always crosses (match loop cost)
 //     NB: see the confound note in main(). Matching only ever touches
@@ -439,45 +480,7 @@ Stats benchmarkMixedFlow(generator& gen, int levels, int iterations,
 //  live orders is ~2x iterations. A warm-up smaller than the peak leaves
 //  the sweep still faulting new pages.
 // ---------------------------------------------------------------------
-void processWarmup(generator& gen, int iterations) {
-    const int peak   = iterations * 2;
-    const int levels = 10'000;   // widest tree the sweep will build
 
-    for (int pass = 0; pass < 2; ++pass) {
-        OrderBook book;
-        std::vector<Id> ids;
-        ids.reserve(peak);
-
-        // Resting inserts across a wide band: grows the arena to peak size
-        // and populates the cancel index to peak occupancy.
-        for (int i = 0; i < peak; ++i) {
-            Order o{Side::Buy, Type::Limit, spreadPrice(i, levels), 100, gen.nextId++, 0};
-            book.rest(o);
-            ids.push_back(o.id);
-        }
-
-        // Touch each hot path so its code and branch history are warm too.
-        const int slice = peak / 8;
-        for (int i = 0; i < slice; ++i) {
-            book.modify(ids[i], std::nullopt, 50);
-        }
-        for (int i = slice; i < 2 * slice; ++i) {
-            book.modify(ids[i], scatterPrice(i, levels), std::nullopt);
-        }
-        for (int i = 2 * slice; i < 3 * slice; ++i) {
-            book.cancel(ids[i]);
-        }
-
-        // Crossing path.
-        for (int i = 0; i < slice; ++i) {
-            Order sell{Side::Sell, Type::Limit, spreadPrice(i, levels), 1, gen.nextId++, 0};
-            book.submit(sell);
-        }
-
-        // Book destroyed here: frees everything back to the allocator, which
-        // is the state the sweep's first trial will actually start from.
-    }
-}
 
 // ---------------------------------------------------------------------
 //  Sweep driver
@@ -501,9 +504,14 @@ static void printTable(const char* which,
     }
 }
 
-void runDepthSweep(generator& gen, int iterations = 100'000, int trials = 5) {
+void runDepthSweep(generator gen, int iterations = 100'000, int trials = 5) {
     std::cout << "=== Matching Engine Depth Sweep (submit/cancel/modify isolated, -O3) ===\n";
 
+    auto gen1 = gen;
+    auto gen2 = gen;
+    auto gen3 = gen;
+    auto gen4 = gen;
+    auto gen5 = gen;
     measureClockOverhead();
 
     // REVERSED. If the anomalous p99 row tracks the FIRST depth measured
@@ -523,11 +531,11 @@ void runDepthSweep(generator& gen, int iterations = 100'000, int trials = 5) {
 
         Row r;
         r.levels   = levels;
-        r.subRest  = benchmarkSubmitResting        (gen, levels, iterations, 1'000,  trials);
-        r.subCross = benchmarkSubmitCrossing       (gen, levels, iterations, 1'000,  trials);
-        r.cancel   = benchmarkCancel               (gen, levels, iterations, 1'000,  trials);
-        r.modQty   = benchmarkModifyInPlace        (gen, levels, iterations, 10'000, trials);
-        r.modPrice = benchmarkModifyCancelResubmit (gen, levels, iterations, 1'000,  trials);
+        r.subRest  = benchmarkSubmitResting        (gen1, levels, iterations, 1'000,  trials);
+        r.subCross = benchmarkSubmitCrossing       (gen2, levels, iterations, 1'000,  trials);
+        r.cancel   = benchmarkCancel               (gen3, levels, iterations, 1'000,  trials);
+        r.modQty   = benchmarkModifyInPlace        (gen4, levels, iterations, 10'000, trials);
+        r.modPrice = benchmarkModifyCancelResubmit (gen5, levels, iterations, 1'000,  trials);
         rows.push_back(r);
     }
 
@@ -617,6 +625,9 @@ void runMixedFlow(generator& gen, int iterations = 100'000, int trials = 5) {
 
 
 
+
+
+
 int main(int argc, char** argv) {
     calibrateSpinCost();
     int  iterations = (argc > 1) ? std::atoi(argv[1]) : 100'000;
@@ -636,6 +647,52 @@ int main(int argc, char** argv) {
     
 
     runDepthSweep(gen, iterations);
-    runMixedFlow(gen, iterations);
+    //runMixedFlow(gen, iterations);
+    /*for(int j = 1; j <= 5; ++j){
+    int levels = std::pow(10, j);
+
+    std::println("Depth {}  ------------------------------------------------------------------------", levels);
+    
+    std::println("Cancel:");
+    for(int i = 0; i < 1; ++i){
+        //Stats s = benchmarkSubmitResting(gen, 100, 100000);
+        Stats s = benchmarkCancel(gen, levels, 100000);
+        std::printf("p50: %.2f  p99: %.2f  mean: %.2f\n", s.p50, s.p99, s.mean);
+    }
+
+    std::println("Submit Resting:");
+    for(int i = 0; i < 1; ++i){
+        Stats s = benchmarkSubmitResting(gen, levels, 100000);
+        
+        std::printf("p50: %.2f  p99: %.2f  mean: %.2f\n", s.p50, s.p99, s.mean);
+    }
+
+    std::println("Submit Crossing:");
+
+    for(int i = 0; i < 1; ++i){
+        Stats s = benchmarkSubmitCrossing(gen, levels, 100000);
+        
+        std::printf("p50: %.2f  p99: %.2f  mean: %.2f\n", s.p50, s.p99, s.mean);
+    }
+
+    std::println("Modify In Place:");
+
+    for(int i = 0; i < 1; ++i){
+        Stats s = benchmarkModifyInPlace(gen, levels, 100000);
+        
+        std::printf("p50: %.2f  p99: %.2f  mean: %.2f\n", s.p50, s.p99, s.mean);
+    }
+
+    std::println("Modify Resubmit:");
+
+    for(int i = 0; i < 1; ++i){
+        Stats s = benchmarkModifyCancelResubmit(gen, levels, 100000);
+        
+        std::printf("p50: %.2f  p99: %.2f  mean: %.2f\n", s.p50, s.p99, s.mean);
+    }
+
+    std::println(" End of Depth {}  ------------------------------------------------------------------------", levels);
+    }*/
+    
     return 0;
 }

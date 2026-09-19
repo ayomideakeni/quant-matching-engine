@@ -16,11 +16,12 @@
 | Concurrency (build) | MPSC queue, single-writer loop, adversarial tests |
 | Benchmarking | Percentile harness, depth sweep, profiling, optimisation |
 | Hardening | Multi-TU correctness sweep, benchmark instrument rebuild, queue bounding |
+| Diagnosis | Hypothesis-driven optimisation sweep; locating the remaining cost |
 
 ---
 
 ## Status board
- 
+
 | Component | State | Tests |
 |---|---|---|
 | `Order` type | ✅ done | integer ticks, seq-not-clock, id-vs-seq |
@@ -54,14 +55,187 @@
 | Multi-TU correctness sweep (`orderBook.hpp`) | ✅ done | full suite + both sanitisers + fuzzer green; 2-TU link verified |
 | Benchmark instrument rebuild (`BenchSample`, weighted stats) | ✅ done | index-correspondence and reallocation bugs fixed; percentiles now operation-weighted |
 | Concurrent-path saturation finding | ✅ measured | queue never drops below a full batch at any producer count ≥ 1; writer is the binding constraint |
-| Bounded queue + retry/yield pacing | ✅ built, measured | reject-on-full now genuinely exercised; bounded vs unbounded trade-off characterised at 2 and 8 producers |
-| Warm-up for `concurrentBench` | ⬜ designed, not filled in | parameter and branch exist; sizing and generation outstanding |
- 
-**Status: correct, concurrent, tested, measured, and hardened.** 23 hand-written tests · 100k single-threaded fuzzed operations across 4 invariants with zero violations · a shrinker proven against an injected bug · 1.6 M operations through the queue across 1–16 producers · determinism verified in both directions · clean under ThreadSanitizer and AddressSanitizer · a completed profile → optimise → re-measure loop (allocation, not tree traversal, was the depth curve's cause) · a lock-free queue built, measured, and reverted on evidence · the benchmark instrument itself audited and rebuilt after it was found to be measuring load-dependent batch dilution rather than the system · the concurrent path shown to run in permanent backlog at any producer count, with bounded-vs-unbounded queue behaviour now characterised as a genuine floor/ceiling trade-off rather than a single number. The matching core is byte-identical to its single-threaded form; the concurrency layer wraps it without touching it.
+| Bounded queue + retry/yield pacing | ✅ built, measured | reject-on-full now genuinely exercised; bounded vs unbounded characterised as a floor/ceiling trade-off |
+| Warm-up for `concurrentBench` | ✅ built, swept | no measurable effect at 2+ producers; contention dominates cold-start by ~2 orders of magnitude |
+| C5 — atomics under the mutex | ✅ removed, measured | p50 −3 ns, mean −5 ns, consistent across 8 paired runs; tails unaffected |
+| C1 — `alignas(64)` on `Order` | ⏸ parked | bit-identical p50/p99 across 7 runs: instrument-limited at batch 10, not a null result |
+| C2 — free-list fragmentation | ✅ tested | 500k ops at 45% cancel, flat across 10 checkpoints; pool contiguity absorbs free-list scatter |
+| Q1 — `notify_one` outside the lock | ✅ changed, measured | no measurable effect; kept as conventionally correct, reason recorded |
+| Q3 — copy inside the critical section | ⏸ analysed | irreducible under a mutex; all four escape routes closed or below resolution |
+| `cancelIndex`: separate chaining → open addressing | ✅ done, measured | isolated ~40% faster on cancel at every depth (uniform, not depth-compressing); concurrent p50 −6ns, retries −15–20% |
+| Generator-sharing cross-contamination (sweep) | ✅ found, fixed | shared `nextId`/RNG state was shifting downstream benchmarks' inputs; fixed via per-call generator construction |
+| `cancelIndex` flat-map storage pre-reservation | ⬜ outstanding | needed or hot-path allocation risk returns |
+| `generator`'s RNG (shared across producers, quality vs xoshiro) | ⬜ outstanding | flagged, not yet investigated |
+| C3 / C4 — double validation, `idsAt` copies | ⬜ outstanding | single-threaded path, small, untested |
+
+**Status: correct, concurrent, tested, measured, hardened, and diagnosed.** 23 hand-written tests · 100k single-threaded fuzzed operations across 4 invariants with zero violations · a shrinker proven against an injected bug · 1.6 M operations through the queue across 1–16 producers · determinism verified in both directions · clean under ThreadSanitizer and AddressSanitizer · a completed profile → optimise → re-measure loop (allocation, not tree traversal, was the depth curve's cause) · a lock-free queue built, measured, and reverted on evidence · the benchmark instrument itself audited and rebuilt after it was found to be measuring load-dependent batch dilution rather than the system · the concurrent path shown to run in permanent backlog at any producer count, with bounded-vs-unbounded queue behaviour characterised as a genuine floor/ceiling trade-off · a four-hypothesis diagnostic sweep converging on the finding that the mutex's contents are cheap and the lock itself is the remaining cost · and the cancel index moved from separate chaining to open addressing, a uniform ~40% win at every depth that exposed a second, unrelated benchmark-methodology bug (shared generator state contaminating cross-function timing) in the process of confirming it. The matching core is byte-identical to its single-threaded form; the concurrency layer wraps it without touching it.
 
 ---
 
 ## Session entries
+
+## Cancel index: separate chaining to open addressing, and a generator-sharing bug found along the way
+
+### Why cancel was worth revisiting
+
+The depth sweep had already flagged cancel's 3.3× growth from 10 to 10,000 levels as partly attributable to "colder cancel-index buckets" — `cancelIndex` is `std::unordered_map<Id, Order*>`, which the standard effectively mandates as separate chaining: a bucket array of pointers, each pointing to a linked list of heap-allocated nodes. Every lookup is a minimum of two pointer-chases to separately-allocated memory — the bucket array, then a node — regardless of load factor. That is a guaranteed cache miss on every cancel and every price-change modify, independent of book depth.
+
+### The swap
+
+Replaced `cancelIndex`'s container with `boost::unordered_flat_map<Id, Order*>` — open addressing, entries stored directly in one contiguous array, collisions resolved by probing rather than by chaining to a separate node. Interface matched closely enough that `find`, `erase`, `operator[]`, and `end()` compiled unchanged at every call site (`rest`, `cancel`, `contains`, `getOrderInfo`, `checkNoOrphans`).
+
+Two things to revisit before trusting this at scale: flat maps generally do not guarantee reference stability across a rehash (confirmed the codebase stores `Order*` as the *value*, not references into the map, so this is currently safe — but worth reconfirming if anything changes), and — flagged live during interview-prep review rather than caught during the work itself — the flat map's internal storage still needs pre-reserving at expected load, or it reintroduces exactly the reallocation-on-the-hot-path problem the pool was built to eliminate. **Not yet addressed. Recorded as outstanding.**
+
+### The generator-sharing bug
+
+First comparison, run through the full `runDepthSweep`, showed cancel improving as expected but `benchmarkSubmitResting` — which never touches `cancelIndex` — degrading at high depth in the *same* run, despite nothing else changing. `benchmarkSubmitResting` run in complete isolation was flat before and after the swap, which ruled out the hash map itself as the cause and pointed at something specific to running multiple benchmarks in sequence.
+
+Traced to `generator`: a single instance shared across every function call in the sweep, at every depth, carrying one incrementing `nextId` counter and one `mt19937` RNG. `benchmarkCancel`'s consumption of that shared state — how many ids it draws, in what pattern — differs under the new map's iteration order versus the old one's, which shifts the exact ids and prices every *subsequent* function in the sweep receives. Confirmed by constructing a fresh `generator` per benchmark call rather than threading one through the sweep: the submit-resting anomaly disappeared completely, flat at 8.3 ns across all four depths.
+
+This is the same failure shape as three earlier entries in this log — a test passing or producing a number while silently exercising something other than what was intended — caught the same way: by noticing an inconsistency (a function with no dependency on the changed code producing a changed result) and refusing to accept it as coincidence.
+
+### Results
+
+**Isolated, single depth, `benchmarkCancel` alone, four runs (first discarded as the established first-run-in-process effect):**
+
+| | before | after |
+|---|---|---|
+| p50 | 45.8 ns (all four) | 25.0–29.2 ns |
+| p99 | 62.5 ns (all four) | 37.5 ns (all four) |
+| mean | 44.8–46.2 ns | 27.1–28.9 ns |
+
+Roughly 40% faster on p50, mean, and p99, with no overlap across four independent runs on either side.
+
+**Full depth curve, separated generators (the clean measurement):**
+
+| levels | cancel p50 before | cancel p50 after | cancel p99 before | cancel p99 after |
+|---|---|---|---|---|
+| 10 | 33.3 | 16.7 | 45.9 | 25.0 |
+| 100 | 45.8 | 29.1 | 58.3 | 37.5 |
+| 1000 | 54.2 | 37.5 | 70.9 | 50.0 |
+| 10000 | 83.4 | 58.4 | 112.5 | 91.7 |
+
+Growth from 10→10,000: 2.5× before, 3.5× after. **The scaling did not compress — if anything it is marginally steeper in relative terms — while the absolute cost dropped by a consistent ~40% at every depth.** That is a different finding from the one predicted. The hypothesis going in was that cold buckets were contributing to the depth-dependent growth; the result instead shows a *constant* per-lookup cost was removed (the pointer-chase to a separately-allocated node, paid identically regardless of depth), while whatever actually drives the growth from 10 to 10,000 — plausibly the price-level `std::map`'s own tree walk, untouched by this change — remains exactly as steep as before.
+
+**Concurrent path, 2 producers × 800,000 ops each, drain cap 64, queue capacity 4096, five runs (first discarded):**
+
+| | before | after |
+|---|---|---|
+| p50 | 65.1–65.8 ns | 59.9–60.5 ns |
+| mean | 74.8–76.4 ns | 69.0–70.0 ns |
+| p99 | 187.5–196.6 ns | 181.6–184.2 ns |
+| retries | 2.38M–2.61M | 1.98M–2.22M |
+
+p50 down ~6 ns, mean down ~6 ns, retries down 15–20%, no overlap on p50 or mean across either side. Larger than a naive dilution argument predicts (cancel is one-fifth of the default operation mix; a ~40% win on one-fifth of operations should not move overall p50 by ~9%). The more likely mechanism: the writer is a single serial resource, so making *any* operation it performs faster increases overall throughput, which drains the backlog faster and reduces how often producers contend for the mutex at all — a win on one operation type propagating into reduced contention system-wide. Consistent with the standing "writer is a throughput ceiling" framing; not yet isolated from the possibility that the retry reduction is doing most of the p50 work rather than the reverse.
+
+Tail figures (p99.9, max) also appeared to move further than the median, but have not been tested across enough runs to state as a finding — same standard applied everywhere else in this project: medians reproduce quickly, tails need repetition, and a difference glimpsed across five runs is not yet a claim.
+
+### Outstanding from this session
+
+- Pre-reserve `cancelIndex`'s flat-map storage at expected load; unaddressed, and structurally the same hot-path-allocation risk the pool was built to remove
+- Tail-figure (p99.9/max) improvement on the concurrent path: real but unconfirmed at the rigour this project holds everything else to
+- `generator`'s RNG quality flagged as a separate open question (raised, not yet investigated) — currently `std::mt19937`, shared across all producer threads in `concurrentBench` rather than one instance per producer, which is a distinct issue from the id/price-consumption bug above and has not yet been characterised
+- C3 (double validation on the resting path) and C4 (`idsAt` copying `Order` by value) remain untouched
+
+
+## The C-group hypotheses, and diagnosing where the queue's cost actually lives
+
+Four hypotheses registered from the audit, tested in sequence. One positive, two negative, one parked on an instrument limitation — and the accumulated result points somewhere the individual findings don't, which is the useful part.
+
+### C5 — atomics under the mutex. Positive.
+
+`head`, `tail` and `count` were `std::atomic<size_t>`, but every access to all three happens inside `std::unique_lock`. The mutex already provides exclusion, so the atomicity was buying nothing — while every `buffer[head]` and `buffer[tail]` paid for a seq_cst load, and the compiler and CPU were prevented from reordering memory operations across accesses that no other thread could observe mid-update anyway.
+
+Changed all three to plain `size_t`. Paired comparison, same configuration both sides, three runs with and five without:
+
+p50 fell from 78.8–80.1 ns to 74.9–76.8 ns. Mean fell from 92.0–93.6 to 86.2–88.1. p99 fell from 213.5–217.5 to 201.2–206.4. Every "without" run beat every "with" run on p50 and mean, with no overlap across eight runs — which is what makes a ~3 ns effect credible rather than noise. p99.9 overlapped (288–307 against 274–316) and the claim stops there, consistent with the standing observation that medians reproduce and tails need repetition.
+
+The `alignas(64)` separation on those three fields is now guarding against false sharing that cannot occur, since the accesses are not concurrent. Kept for now as documentation of intent, flagged as a decision to make rather than leave ambiguous.
+
+### C1 — cache-line straddling on `Order`. Parked: instrument-limited.
+
+`sizeof(Order)` is 56 bytes with 8-byte alignment — two `enum class` fields at 4 bytes each (8 bytes carrying two values that each fit in a byte), four `int64_t`, two pointers. The pool packs them contiguously in a `std::vector<Order>`, and 56 does not divide 64, so past the first slot essentially every `Order` straddles two cache lines.
+
+Tested `alignas(64)`, which forces one line per order at 8 bytes of padding per slot. Measured through `benchmarkSubmitResting` at 100 levels, 100k iterations, seven runs across both configurations.
+
+**p50 came back as exactly 8.30 and p99 as exactly 12.50 on every single run, both configurations.** Not "no significant difference" — bit-identical, seven times. At batch size 10 and roughly 8 ns per operation, each timed batch spans about 80 ns, against a calibrated clock cost of ~16.8 ns per call. The harness cannot resolve a single-digit-nanosecond effect at that batch size; every batch lands on the same discrete rung regardless of what is happening underneath. Only the mean moved (8.09–8.99 without, 8.19–8.68 with) and that range is ordinary run-to-run noise.
+
+Recorded as **inconclusive by instrument limitation, not as a null result** — the two are different claims and conflating them would be the same error as quoting a diluted p99 across drain caps. What it does establish is an upper bound: whatever `alignas(64)` is worth here, it is smaller than the atomics effect that *was* measurable, which is useful for knowing where the remaining headroom is not. Resolving it properly would need hardware performance counters rather than wall-clock timing.
+
+Same measurement-floor phenomenon already recorded for modify-in-place reporting a mean below its median. Third time this project has been bounded by the instrument rather than by the system.
+
+### C2 — free-list fragmentation over a sustained run. Negative.
+
+The pool's free list is built at construction by deallocating from `n-1` down to `0`, so `freeHead` starts at `slots[0]` and the chain runs forward through memory — the first pass of allocations is perfectly sequential. Cancels then return slots in whatever order orders happen to be cancelled, which bears no relation to their position in the array, so the free list progressively scrambles into an arbitrary pointer chase across the pool.
+
+Every existing benchmark builds a fresh `OrderBook` per trial, specifically to isolate one operation's cost — which means this question was structurally invisible to all of them. The pool never lived long enough to fragment.
+
+Built `fragTest`: one long-lived book, a 500,000-operation stream at a deliberately churn-heavy mix (45% modify, 10% submit, 45% cancel — chosen to fragment fast, not to be representative; 50/30/20 is already covered by the existing fuzz runs), with the run divided into ten checkpoints. At each checkpoint the churn pauses and a batch of 1,000 submits is timed. Batch size 1,000 rather than 10 deliberately: at ~8 ns/op a batch of 10 sits too close to the measurement floor, and the target here is a *trend across checkpoints* rather than a distribution within one.
+
+This required parameterising the operation mix, which was hardcoded in two separate places with drifted implementations — `generateRequest` (builds a `Request` vector, tracks ids via `reqWindow`) and `generateAndExecute` (applies directly to a book, tracks via `gen.restingIds`). Weights moved onto `generator` as boundaries into the existing `operationDist(0, 99)` range, with a constructor taking percentages and asserting they sum to 100, plus `generator() = default` so every existing construction site is unaffected.
+
+**Result: flat.** Run one showed a strong monotonic *decrease* (216 → 95 ns across ten checkpoints) which is process warm-up, not fragmentation — page faults, cold predictors, cold instruction cache clearing out, the same positional effect already characterised in the depth sweep. Runs two through five, past that: noise in a roughly ±8 ns band around ~99 ns, with the tenth checkpoint no slower than the first and frequently faster.
+
+500,000 operations with ~225,000 cancels against a 100,000-slot pool means every slot was returned roughly twice on average — thoroughly scrambled — with no measurable cost drift.
+
+**The mechanism.** The free list is a pointer chase, but it chases through a single contiguous `std::vector<Order>` of about 5.6 MB. Scattered order within one largely-resident allocation costs far less than sequential-versus-random intuition suggests — the hardware prefetcher and the locality of the region absorb it. The pool's *contiguity* is doing the work, independently of the free list's ordering.
+
+That validates the pool design more strongly than a clean sequential test would, because it shows the benefit survives realistic churn rather than depending on pristine allocation order.
+
+One figure recorded as unexplained: ~99 ns per submit here against 8.3 ns in `benchmarkSubmitResting`. Likely book depth — the churned book has a very different level structure than the cleanly-seeded one, and the depth sweep showed submits ranging 20.8 → 62.5 ns across depths before the pool change — but not measured, so not claimed.
+
+### Q1 — `notify_one` inside the critical section. Negative.
+
+`push` called `convar.notify_one()` as the last statement before releasing the lock. Given the queue runs in permanent backlog, the writer is essentially never waiting on the condition variable, so nearly every one of those notifies does nothing except extend the lock hold — and 3.8 million retry attempts are queueing behind that lock.
+
+Moved the notify after an explicit `lock.unlock()`. Prediction registered beforehand: the notify itself is cheap when nobody waits, so the effect should show in retry count and p50 rather than in the tail.
+
+**No effect.** Baseline p50 76.8–78.1, after 77.5–78.1. Mean 89.0–91.1 against 89.3–90.0. Retries 3.72M–3.86M against 3.72M–3.75M. Complete overlap on everything; the retry count sat at the bottom of the baseline range rather than below it. (Run one discarded as the first-run-in-process effect, its retry count of 3.13M being the outlier rather than a signal.)
+
+Kept anyway — notifying outside the lock is conventionally correct, because in the case where a thread *is* waiting it avoids waking that thread onto a mutex the notifier still holds. This workload never hits that case, which is exactly why nothing showed. Recorded with the reason, so it does not look like an unmotivated change later.
+
+### Q3 — the copy inside the critical section. Analysed, no cheap win available.
+
+`buffer[tail] = r` copies a `Request` — roughly 96 bytes: a tag, a full `Order` at 56, an `Id`, and two `std::optional`s — while holding the lock. Plausibly the largest single thing in the critical section, and unconditional on every successful push.
+
+Four escape routes considered, three closed:
+
+**Move instead of copy.** Does nothing. Move semantics help when a type owns a resource that can be handed over — a heap allocation, a buffer pointer. Every member of `Request` is trivially copyable, so the compiler-generated move assignment is byte-identical to copy assignment. Same for `std::swap`, which for a type with no specialised swap is three moves, i.e. three byte copies rather than one — strictly worse.
+
+**Store `Order` as an `optional` or a pointer.** `std::optional<Order>` is `sizeof(Order)` plus a flag plus padding — it grows the struct rather than shrinking it, because optional buys the ability to *represent* absence, not to avoid storing space for the value. A pointer genuinely shrinks the field from 56 bytes to 8, but relocates the problem: the `Order` has to live somewhere with a lifetime spanning both threads. Allocating one per push reinstates the `malloc` on the hot path that the pool exists to remove; pointing at producer-owned memory makes the queue non-owning and hands the writer a pointer into another thread's storage. Fixing that properly means a second cross-thread pool with consumption-confirmed reclamation — more machinery than the thing being optimised.
+
+**Strip structurally-dead fields.** A queued `Request` always carries `seq = 0` (assigned by `rest()` on the writer thread) and `next`/`prev` both null (set only when an order joins a price level, which a queued request never has). That is 24 of the ~96 bytes guaranteed meaningless at copy time. Achievable by giving `Request` a submit payload carrying only the five fields a producer actually sets, with `writerLoop` constructing the `Order` before calling `submit`. Expected saving: three fewer 8-byte moves, so low single-digit nanoseconds — at or below the resolution that measured the notify change as nothing. Also shifts construction work onto the writer, which is already the bottleneck.
+
+**Claim the slot under the lock, copy outside it.** Capture an index, advance `tail`, release, then write. The critical section becomes pure index arithmetic. But `count` was already incremented, so the writer can drain a slot the producer has not finished writing. Fixing that requires a per-slot published marker with release/acquire pairing — which is the per-slot sequence-number scheme of the lock-free queue already built and reverted.
+
+### What the four findings say together
+
+Individually: one small win, two nulls, one dead end. Together they point somewhere none of them does alone.
+
+Two independent lines of evidence now say **the critical section's contents are cheap and the lock itself is the cost**. Removing the notify from inside the lock measured as nothing. The copy analysis shows the remaining shaveable bytes are below instrument resolution, and the only ways to remove the copy entirely require abandoning the mutex. Meanwhile 3.8 million retry attempts against 1.6 million operations means roughly 2.4 wasted lock acquire/check/release cycles per useful operation, every one of them contending directly with the writer for the same mutex.
+
+That is a materially better-supported position than the one that motivated the first lock-free attempt, which reasoned from the tail diagnosis alone ("the tail is lock acquisition, therefore remove the lock").
+
+**And it supports a specific hypothesis about why that attempt failed.** The lock-free queue was measured against the *unbounded* queue, before bounding and retry-with-yield pacing existed — producers raced at full speed, unpaced, hammering the structure as hard as they could. Its p99.9 improved 17× but maxima degraded to milliseconds, and it was reverted on that evidence. The load pattern has since changed fundamentally. The hypothesis worth testing: **those millisecond maxima were an artifact of unpaced producers rather than inherent to the lock-free design, and under bounded-plus-paced load it behaves differently.**
+
+That explains the prior result rather than ignoring it, it is testable, and the code still exists.
+
+### Baseline for whatever comes next
+
+2 producers × 800,000 operations, drain cap 64, queue capacity 4096, five runs:
+
+p50 76.8–78.1 ns · mean 89.0–91.1 ns · p99 205.7–210.9 ns · p99.9 274.7–289.7 ns · retries 3.72M–3.86M.
+
+Tight enough that anything moving p50 by more than ~2 ns or retries by more than ~5% is signal.
+
+For decomposition: single-threaded mixed flow sits at ~37.5 ns p50. So roughly half of the 76 ns concurrent figure is matching logic — already heavily optimised — and roughly half is coordination, which has barely been touched. That is where the headroom is.
+
+### Still open
+
+C3 (`submit` validates, then `rest` validates the same order again — two full validations including two duplicate-id hash probes per resting submit) and C4 (`idsAt` copies each 56-byte `Order` where a reference would do, inside the determinism check) remain untouched. Both small, both on the single-threaded path where the instrument has better resolution than it did for C1.
+
+`fragTest` discards its first run by eye rather than in code. Worth making the throwaway pass internal so the output is clean and the discard cannot be forgotten by a future reader — including future me copying numbers into a writeup.
+
 ## Correctness sweep, benchmark instrument overhaul, and the concurrent-path saturation finding
 
 Two things happened this session: a full audit of `orderBook.hpp` against multi-translation-unit compilation (needed before the feed handler adds a second `.cpp`), and a rebuild of `concurrentBench`'s measurement machinery, which surfaced a finding about the writer that changes how every concurrent number in this project should be read.

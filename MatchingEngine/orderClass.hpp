@@ -11,7 +11,7 @@ enum class Type{
     Limit
 };
 
-struct Order{
+struct  Order{
     Side side;
     Type type;
     int64_t price;
