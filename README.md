@@ -24,7 +24,65 @@
 
 These are the best concurrent figures this project has produced — better than the intermediate step with only the cancel-index swap in place, which was itself better than the original configuration. As everywhere else in this document, these are **percentiles of batch means** (batch size fixed at 64 here), not of individual operations — see *Benchmarking, Method* for why that distinction is real.
 
+## Cancel index: separate chaining to open addressing
+
+`cancelIndex` was `std::unordered_map<Id, Order*>` — separate chaining, meaning every lookup follows a pointer from a bucket array to a separately-allocated node, at least two jumps to unrelated memory regardless of load factor. Replaced with`boost::unordered_flat_map<Id, Order*>`, sized at construction from the pool's own capacity so it never needs to grow: every entry stored directly in one contiguous array, collisions resolved by probing rather than by chaining.
+
+**Isolated, four runs each side: cancel's p50 fell from 45.8 ns to 25.0–29.2 ns — roughly 40% faster, uniformly across every depth tested, 10 to 10,000 levels.** The growth ratio from 10 to 10,000 levels did not compress — if anything it was marginally steeper in relative terms (2.5× before, 3.5× after) even as the absolute cost fell at every point. That is the signature of removing a **constant** per-lookup cost — the pointer-chase to a separately-allocated node, paid identically regardless of depth — rather than the depth-dependent scaling, which is plausibly the price-level map's own traversal cost and is addressed separately below.
+
+**Concurrent path, five runs each side: p50 fell roughly 6 ns, mean roughly 6 ns, retries fell 15–20%.** Larger than dilution alone predicts — cancel is a fifth of the operation mix, and a 40% win on a fifth of operations should not move overall p50 by nearly 9%. The writer is a single serial resource: making any operation it performs faster increases throughput and drains the backlog sooner, which reduces how often producers contend for the mutex at all — a win on one operation type compounding into reduced contention system-wide.
+
+## Price levels: two containers tried, one adopted
+
+`bids`/`asks` stayed `std::map<Price, level>` through the cancel-index work — ordering is required here (`best()` needs the extremum, the match loop sweeps consecutive prices), which rules out a hash map outright.
+
+**`boost::flat_map`**** — tried, rejected on a specific, measured cost.** A sorted contiguous vector: lookup by binary search, `begin()`/`rbegin()` unchanged, but insertion and erasure cost O(n) element shifts rather than O(log n) tree relinking. Isolated resting-submit cost was excellent — flat at 4.2 ns across every depth, the best figure measured anywhere in this project. Cancel and submit-crossing were not: cancel's p99 rose from 29.2 ns at depth 10 to **620.8 ns at depth 10,000**, a 21× blowup, because cancel's empty-level cleanup erases from the map, and erasing near the front of a 10,000-element sorted vector shifts everything after it. Confirms exactly what the container's own documentation warns about — cheap for bulk load, expensive for one-at-a-time erase — rather than assuming it.
+
+**`absl::btree_map`**** — tried, adopted.** A B-tree: still ordered, but storing multiple keys per node in contiguous storage rather than one key per heap-allocated node, giving fewer and denser cache lines per lookup than a red-black tree without the flat vector's erase cost, since erasing from a B-tree node touches only that node and its immediate siblings. Isolated: resting-submit flat at 8.3 ns across every depth from 10 to 100,000, matching the pool-optimised figure and never degrading. Cancel improved over the original tree at every depth while preserving a comparable growth ratio — a genuine constant-factor improvement in cache behaviour, not a change in asymptotic shape. Submit-crossing, unplanned, showed the same benefit, since crossing erases resting orders as it consumes them.
+
+**A debugging detour worth keeping.** An early concurrent-path measurement of this change showed catastrophic regression — p50 near 850 ns, worse than every prior configuration. Two hypotheses were tested in sequence rather than assumed. Queue-capacity was ruled out immediately, since the isolated numbers already showed a clear win. Allocator contention between threads — plausible, since B-tree node splits allocate — was tested with a direct falsification: if true, a single producer should show *less* contention than two. It showed **more**, which disproves the theory rather than merely failing to confirm it. The actual cause, found by inspection once the wrong theory was abandoned: the build used for this specific comparison omitted `-O3`. Heavily templated code written assuming aggressive inlining — which this container's internals are — degrades far more under an unoptimised build than the simpler containers tested earlier in the same session, since every small accessor and comparator becomes a real, un-inlined function call. Re-measured under this project's standard flags, the concurrent result matched the isolated one: p50 52.7–54.7 ns, mean 62.1–65.9 ns, retries per operation back to 1 — the best concurrent figures produced by any configuration in this project.
+
+## Diagnosing and fixing the concurrent tail
+
+**The instrument itself was wrong, and it was rebuilt.** Concurrent-path timing stored three parallel vectors — a batch's duration, its lock-wait time, and whether the drain slept — under-reserved, so the vectors reallocated inside the timed region on longer runs. Worse, the function computing percentiles sorted its input in place, silently destroying the correspondence between a batch's duration and its own metadata for any analysis that ran afterward. And the mean and percentiles were computed as an unweighted average across batches, which over-weights small batches relative to large ones whenever batch size varies. Rebuilt: one struct per batch holding all four fields together, reserved once; a weighted mean (total time over total operations); percentiles computed by walking batches sorted by cost while accumulating the operations each one represents, rather than indexing by batch position. Every concurrent figure below this line comes from the corrected instrument. Figures elsewhere in this document from before the fix should be read as directional rather than exact.
+
+**Two independent findings, from two different instruments, agree on the cause.** Before the rebuild, three targeted experiments — a calibrated spin-before-sleep that changed nothing, a partition of samples by whether the drain actually slept (showing the writer almost never sleeps), and direct timing of lock acquisition itself (bimodal: instant almost always, tens of microseconds rarely) — pointed at lock **acquisition** as the source of the tail, not wake-up latency. After the rebuild, measuring with the corrected instrument found something independent and structural: the queue never once dropped below a full batch, at any producer count tested, down to and including a single producer. The queue had been sized to fit every operation a benchmark run would ever produce, specifically so it could never fill — which meant it ran in **permanent backlog** for its entire life, and reject-on-full, defended at length in this document's design section, had never once fired under measurement. A queue in permanent backlog is exactly the condition that produces constant, structural contention for the writer's mutex — the same conclusion the three experiments reached, reached again by an unrelated route.
+
+**The fix: bound the queue, and let bounding do double duty as backpressure.** The queue was given a fixed capacity. Producers, which had asserted every push succeeded, were changed to retry — spin briefly, then yield, repeating until the push lands — turning a bounded queue into a self-pacing rate limiter: a producer can only push once the writer has freed a slot, so its effective rate becomes the writer's rate with no calibrated delay required.
+
+Measured against the old, unbounded configuration, at 2 producers:
+
+| unboundedbounded + paced |          |        |
+| ------------------------ | -------- | ------ |
+| p50                      | 47 ns    | 80 ns  |
+| p99                      | 438 ns   | 210 ns |
+| p99.9                    | 745 ns   | 278 ns |
+| max                      | 1,281 ns | 750 ns |
+
+At 8 producers:
+
+| unboundedbounded + paced |          |          |
+| ------------------------ | -------- | -------- |
+| p50                      | 50 ns    | 112 ns   |
+| p99                      | 858 ns   | 920 ns   |
+| p99.9                    | 1,682 ns | 1,340 ns |
+| max                      | 8,973 ns | 2,500 ns |
+
+**A genuine trade, not a strict improvement.** The median rises because producers can no longer race ahead and finish early — under the old configuration they did, leaving the writer to process most of its work uncontended; under bounding they stay alive retrying for the whole run, so every drain now contends with live producer threads. The tail falls at low producer counts because yielding breaks the worst-case pattern where producers hammer the mutex fast enough to starve the writer entirely — but the benefit shrinks as producer count rises, because `yield()` is undirected: it tells the scheduler to run something else, and with more producers competing, that something else is frequently another producer rather than the writer that would actually free a slot. Retries per operation held at 2–3 across every count tested, suggesting the saturation level itself does not scale much with producer count — more producers share the wait rather than compounding it.
+
 ---
+
+### Four hypotheses, tested against the corrected instrument
+
+**Atomics on the queue's ****`head`****/****`tail`****/****`count`**** — removed, real effect.** All three were `std::atomic<size_t>` despite being touched only inside the queue's own mutex, which already provides exclusion — so every index operation paid for a memory-ordering guarantee against concurrent access that could not occur. Changed to plain `size_t`. Paired comparison, eight runs: p50 fell from 78.8–80.1 ns to 74.9–76.8 ns, mean from 92.0–93.6 to 86.2–88.1, with no overlap across any run on either side.
+
+**`alignas(64)`**** on ****`Order`**** — parked, instrument-limited.** `Order` is 56 bytes; the pool packs them contiguously, so past the first slot nearly every order spans two 64-byte cache lines. Forcing one line per order was tested against the isolated resting-submit benchmark and came back bit-identical — p50 and p99 unchanged across seven runs in both configurations. Not a null result: at 10 operations per batch and \~8 ns each, the batch duration sits too close to the timing instrument's own resolution (\~17 ns per clock call) to resolve an effect this small.
+
+**Free-list fragmentation over a sustained run — tested, no drift found.** The pool's free list starts perfectly sequential and scrambles as cancels return slots in arbitrary order over time — untestable by any prior benchmark, since each one builds a fresh book per trial. Built a dedicated test: one long-lived book, a 500,000-operation stream weighted heavily toward churn (45% modify, 10% submit, 45% cancel — deliberately different from this project's standard mix, chosen to fragment fast rather than to be representative), ten checkpoints each timing a batch of 1,000 pure submits. After discarding the first checkpoint (the same process-position warm-up effect characterised elsewhere in this document), the remaining nine showed no trend: noise in a roughly ±8 ns band, with the last checkpoint no slower than the first. The free list is a pointer chase, but through one contiguous \~5.6 MB allocation — scattered order within a region that size is absorbed by cache locality and the hardware prefetcher rather than costing what a naive intuition predicts.
+
+## Lock-free queue — on hold
+
+A lock-free variant was prototyped early in the concurrency work and compared against the mutex/condvar queue. That comparison used the benchmark tooling later found to be unreliable (below), so the specific numbers from it are not trusted and the comparison has not been repeated. On hold rather than rejected.
 
 ---
 
@@ -131,6 +189,8 @@ The two sides need opposite natural orderings — best bid is the *highest* buy 
 
 A single price-keyed map, because it needs a composite key or an internal filter at every access and destroys each side's baked-in sort order. A hash map, because it has no ordering, so finding the next-best price after a level empties would need extra bookkeeping or a full scan.
 
+*The container choice here was later revisited after profiling — see "Price levels: two containers tried, one adopted" near the top of this document.*
+
 ---
 
 ## Price Level
@@ -171,27 +231,7 @@ The iterator's validity and the id's meaningfulness expire at the same moment: w
 
 `std::shared_ptr`, because the index does not own the order — the level does — and shared ownership adds atomic refcounting on the hot path for no benefit. Caching price and side alongside the iterator, for the staleness reason above.
 
----
-
-## Cancel index: separate chaining to open addressing
-
-`cancelIndex` was `std::unordered_map<Id, Order*>` — separate chaining, meaning every lookup follows a pointer from a bucket array to a separately-allocated node, at least two jumps to unrelated memory regardless of load factor. Replaced with`boost::unordered_flat_map<Id, Order*>`, sized at construction from the pool's own capacity so it never needs to grow: every entry stored directly in one contiguous array, collisions resolved by probing rather than by chaining.
-
-**Isolated, four runs each side: cancel's p50 fell from 45.8 ns to 25.0–29.2 ns — roughly 40% faster, uniformly across every depth tested, 10 to 10,000 levels.** The growth ratio from 10 to 10,000 levels did not compress — if anything it was marginally steeper in relative terms (2.5× before, 3.5× after) even as the absolute cost fell at every point. That is the signature of removing a **constant** per-lookup cost — the pointer-chase to a separately-allocated node, paid identically regardless of depth — rather than the depth-dependent scaling, which is plausibly the price-level map's own traversal cost and is addressed separately below.
-
-**Concurrent path, five runs each side: p50 fell roughly 6 ns, mean roughly 6 ns, retries fell 15–20%.** Larger than dilution alone predicts — cancel is a fifth of the operation mix, and a 40% win on a fifth of operations should not move overall p50 by nearly 9%. The writer is a single serial resource: making any operation it performs faster increases throughput and drains the backlog sooner, which reduces how often producers contend for the mutex at all — a win on one operation type compounding into reduced contention system-wide.
-
----
-
-## Price levels: two containers tried, one adopted
-
-`bids`/`asks` stayed `std::map<Price, level>` through the cancel-index work — ordering is required here (`best()` needs the extremum, the match loop sweeps consecutive prices), which rules out a hash map outright.
-
-**`boost::flat_map`**** — tried, rejected on a specific, measured cost.** A sorted contiguous vector: lookup by binary search, `begin()`/`rbegin()` unchanged, but insertion and erasure cost O(n) element shifts rather than O(log n) tree relinking. Isolated resting-submit cost was excellent — flat at 4.2 ns across every depth, the best figure measured anywhere in this project. Cancel and submit-crossing were not: cancel's p99 rose from 29.2 ns at depth 10 to **620.8 ns at depth 10,000**, a 21× blowup, because cancel's empty-level cleanup erases from the map, and erasing near the front of a 10,000-element sorted vector shifts everything after it. Confirms exactly what the container's own documentation warns about — cheap for bulk load, expensive for one-at-a-time erase — rather than assuming it.
-
-**`absl::btree_map`**** — tried, adopted.** A B-tree: still ordered, but storing multiple keys per node in contiguous storage rather than one key per heap-allocated node, giving fewer and denser cache lines per lookup than a red-black tree without the flat vector's erase cost, since erasing from a B-tree node touches only that node and its immediate siblings. Isolated: resting-submit flat at 8.3 ns across every depth from 10 to 100,000, matching the pool-optimised figure and never degrading. Cancel improved over the original tree at every depth while preserving a comparable growth ratio — a genuine constant-factor improvement in cache behaviour, not a change in asymptotic shape. Submit-crossing, unplanned, showed the same benefit, since crossing erases resting orders as it consumes them.
-
-**A debugging detour worth keeping.** An early concurrent-path measurement of this change showed catastrophic regression — p50 near 850 ns, worse than every prior configuration. Two hypotheses were tested in sequence rather than assumed. Queue-capacity was ruled out immediately, since the isolated numbers already showed a clear win. Allocator contention between threads — plausible, since B-tree node splits allocate — was tested with a direct falsification: if true, a single producer should show *less* contention than two. It showed **more**, which disproves the theory rather than merely failing to confirm it. The actual cause, found by inspection once the wrong theory was abandoned: the build used for this specific comparison omitted `-O3`. Heavily templated code written assuming aggressive inlining — which this container's internals are — degrades far more under an unoptimised build than the simpler containers tested earlier in the same session, since every small accessor and comparator becomes a real, un-inlined function call. Re-measured under this project's standard flags, the concurrent result matched the isolated one: p50 52.7–54.7 ns, mean 62.1–65.9 ns, retries per operation back to 1 — the best concurrent figures produced by any configuration in this project.
+*This container was later replaced after measurement — see "Cancel index: separate chaining to open addressing" near the top of this document.*
 
 ---
 
@@ -571,6 +611,8 @@ Mixed flow at depth 100, before → after: mean 44.6 → **37.8–38.5** · p50 
 
 ## Book-depth sweep (p50, ns)
 
+**This sweep predates the cancel-index and price-level container work below; see those sections for current figures**
+
 Reporting a single figure implicitly claims the curve is flat. `std::map` is a red-black tree: finding a level is O(log n) comparisons but also **O(log n) separately-allocated nodes**, so it is O(log n) *potential cache misses*.
 
 Two methodology decisions keep this honest. Depth is swept at **constant orders per level**, not constant total, so tree width is isolated rather than traded against list depth. And the **seeding** is parameterised rather than the generator's price band, because widening the band would also collapse the crossing rate the band was chosen to maximise — moving two variables at once.
@@ -659,51 +701,7 @@ Every `rest` called `push_back` on a `std::list`, allocating a node — a `mallo
 
 **Verified under AddressSanitizer** across the full suite, plus determinism over 1,000,000 captured operations replaying byte-identical. ASan is load-bearing here: for a change replacing a standard container with hand-written pointer manipulation, checking every memory access matters more than checking outcomes.
 
-## Lock-free queue — on hold
-
-A lock-free variant was prototyped early in the concurrency work and compared against the mutex/condvar queue. That comparison used the benchmark tooling later found to be unreliable (below), so the specific numbers from it are not trusted and the comparison has not been repeated. On hold rather than rejected.
-
----
-
-## Diagnosing and fixing the concurrent tail
-
-**The instrument itself was wrong, and it was rebuilt.** Concurrent-path timing stored three parallel vectors — a batch's duration, its lock-wait time, and whether the drain slept — under-reserved, so the vectors reallocated inside the timed region on longer runs. Worse, the function computing percentiles sorted its input in place, silently destroying the correspondence between a batch's duration and its own metadata for any analysis that ran afterward. And the mean and percentiles were computed as an unweighted average across batches, which over-weights small batches relative to large ones whenever batch size varies. Rebuilt: one struct per batch holding all four fields together, reserved once; a weighted mean (total time over total operations); percentiles computed by walking batches sorted by cost while accumulating the operations each one represents, rather than indexing by batch position. Every concurrent figure below this line comes from the corrected instrument. Figures elsewhere in this document from before the fix should be read as directional rather than exact.
-
-**Two independent findings, from two different instruments, agree on the cause.** Before the rebuild, three targeted experiments — a calibrated spin-before-sleep that changed nothing, a partition of samples by whether the drain actually slept (showing the writer almost never sleeps), and direct timing of lock acquisition itself (bimodal: instant almost always, tens of microseconds rarely) — pointed at lock **acquisition** as the source of the tail, not wake-up latency. After the rebuild, measuring with the corrected instrument found something independent and structural: the queue never once dropped below a full batch, at any producer count tested, down to and including a single producer. The queue had been sized to fit every operation a benchmark run would ever produce, specifically so it could never fill — which meant it ran in **permanent backlog** for its entire life, and reject-on-full, defended at length in this document's design section, had never once fired under measurement. A queue in permanent backlog is exactly the condition that produces constant, structural contention for the writer's mutex — the same conclusion the three experiments reached, reached again by an unrelated route.
-
-**The fix: bound the queue, and let bounding do double duty as backpressure.** The queue was given a fixed capacity. Producers, which had asserted every push succeeded, were changed to retry — spin briefly, then yield, repeating until the push lands — turning a bounded queue into a self-pacing rate limiter: a producer can only push once the writer has freed a slot, so its effective rate becomes the writer's rate with no calibrated delay required.
-
-Measured against the old, unbounded configuration, at 2 producers:
-
-| unboundedbounded + paced |          |        |
-| ------------------------ | -------- | ------ |
-| p50                      | 47 ns    | 80 ns  |
-| p99                      | 438 ns   | 210 ns |
-| p99.9                    | 745 ns   | 278 ns |
-| max                      | 1,281 ns | 750 ns |
-
-At 8 producers:
-
-| unboundedbounded + paced |          |          |
-| ------------------------ | -------- | -------- |
-| p50                      | 50 ns    | 112 ns   |
-| p99                      | 858 ns   | 920 ns   |
-| p99.9                    | 1,682 ns | 1,340 ns |
-| max                      | 8,973 ns | 2,500 ns |
-
-**A genuine trade, not a strict improvement.** The median rises because producers can no longer race ahead and finish early — under the old configuration they did, leaving the writer to process most of its work uncontended; under bounding they stay alive retrying for the whole run, so every drain now contends with live producer threads. The tail falls at low producer counts because yielding breaks the worst-case pattern where producers hammer the mutex fast enough to starve the writer entirely — but the benefit shrinks as producer count rises, because `yield()` is undirected: it tells the scheduler to run something else, and with more producers competing, that something else is frequently another producer rather than the writer that would actually free a slot. Retries per operation held at 2–3 across every count tested, suggesting the saturation level itself does not scale much with producer count — more producers share the wait rather than compounding it.
-
----
-
-### Four hypotheses, tested against the corrected instrument
-
-**Atomics on the queue's ****`head`****/****`tail`****/****`count`**** — removed, real effect.** All three were `std::atomic<size_t>` despite being touched only inside the queue's own mutex, which already provides exclusion — so every index operation paid for a memory-ordering guarantee against concurrent access that could not occur. Changed to plain `size_t`. Paired comparison, eight runs: p50 fell from 78.8–80.1 ns to 74.9–76.8 ns, mean from 92.0–93.6 to 86.2–88.1, with no overlap across any run on either side.
-
-**`alignas(64)`**** on ****`Order`**** — parked, instrument-limited.** `Order` is 56 bytes; the pool packs them contiguously, so past the first slot nearly every order spans two 64-byte cache lines. Forcing one line per order was tested against the isolated resting-submit benchmark and came back bit-identical — p50 and p99 unchanged across seven runs in both configurations. Not a null result: at 10 operations per batch and \~8 ns each, the batch duration sits too close to the timing instrument's own resolution (\~17 ns per clock call) to resolve an effect this small.
-
-**Free-list fragmentation over a sustained run — tested, no drift found.** The pool's free list starts perfectly sequential and scrambles as cancels return slots in arbitrary order over time — untestable by any prior benchmark, since each one builds a fresh book per trial. Built a dedicated test: one long-lived book, a 500,000-operation stream weighted heavily toward churn (45% modify, 10% submit, 45% cancel — deliberately different from this project's standard mix, chosen to fragment fast rather than to be representative), ten checkpoints each timing a batch of 1,000 pure submits. After discarding the first checkpoint (the same process-position warm-up effect characterised elsewhere in this document), the remaining nine showed no trend: noise in a roughly ±8 ns band, with the last checkpoint no slower than the first. The free list is a pointer chase, but through one contiguous \~5.6 MB allocation — scattered order within a region that size is absorbed by cache locality and the hardware prefetcher rather than costing what a naive intuition predicts.
-
----
+*The concurrent-tail investigation that followed this — including the lock-free prototype, the benchmark-instrument fix, and the queue bounding that resulted — is now presented near the top of this document alongside the current numbers.*
 
 ## Measurement artifacts characterised
 
