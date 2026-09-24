@@ -186,9 +186,13 @@ public:
             return asks;
         }
     }
-
-
-
+    
+    size_t cIndexSize(){
+        return cancelIndex.size();
+    }
+    size_t totalBookSize(){
+        return asks.size() + bids.size();
+    }
 
 
     Side opposite(Side side) const{
@@ -310,7 +314,7 @@ public:
  
     std::optional<std::vector<Fill>> submit(Order& incoming){
         if(!validate(incoming)) return std::nullopt;
-        std::vector<Fill> fills;
+        //std::vector<Fill> fills;
         auto& oppositeSide = getMap(opposite(incoming.side));
             while (incoming.quantity > 0 && !oppositeSide.empty()) {
                auto resting = best(opposite(incoming.side));
@@ -331,7 +335,7 @@ public:
                     /*std::cout << "FILL: " << tradeQty << " @ " << resting->price 
                               << " (Aggressor ID: " << incoming.id 
                               << ", Resting ID: " << resting->id << ")\n";*/
-                    fills.emplace_back(resting->price, tradeQty, incoming.id, resting->id);
+                    //fills.emplace_back(resting->price, tradeQty, incoming.id, resting->id);
 
                     if (resting->quantity == 0) {
                         Id restingId = resting->id;
@@ -345,7 +349,7 @@ public:
         if (incoming.type == Type::Limit && incoming.quantity > 0) {
             rest(incoming);
         }
-        return fills;
+        return std::nullopt;
     }
 
     struct ExpectedLevel {
@@ -517,7 +521,7 @@ std::vector<Id> idsAt(Side s, Price p) const{
 struct Request{
     OpType requestType;
     Order order;
-    Id id;
+    Id id ;
     std::optional<Price> newPrice;
     std::optional<Quantity> newQuantity;
 };
@@ -632,10 +636,12 @@ struct WriterContext {
 };
 
 struct BenchSample{
-    double ns;
-    size_t ops;
-    double lockNs;
-    bool slept;
+    double ns = 0.0;
+    size_t ops = 0;
+    double lockNs = 0.0;
+    bool slept = false;
+    size_t cancelEntries = 0;
+    size_t bookSize = 0;
 
     double opMean() const{
         return ns / ops;
@@ -720,7 +726,10 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
         while (true) {
             bool slept = false;
             double lockNs = 0.0;
+            size_t cIndexSizeBefore = book.cIndexSize();
+            size_t bookSizeBefore = book.totalBookSize();
             auto start = std::chrono::steady_clock::now();
+            
 
             size_t n = queue.waitAndDrain(drained, btx->drainCap, &slept, &lockNs);
             if (n == 0) break;
@@ -730,9 +739,11 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
             }
 
             auto end = std::chrono::steady_clock::now();
+            size_t cIndexSizeAfter = book.cIndexSize();
+            size_t bookSizeAfter = book.totalBookSize();
             auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
-            btx->samples.push_back({static_cast<double>(ns), n, lockNs,slept});
+            btx->samples.push_back({static_cast<double>(ns), n, lockNs,slept, (cIndexSizeAfter - cIndexSizeBefore), (bookSizeAfter - bookSizeBefore)});
         }
     } else {
         drained.reserve(64);

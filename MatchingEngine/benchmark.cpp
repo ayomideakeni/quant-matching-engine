@@ -630,7 +630,7 @@ void runMixedFlow(generator& gen, int iterations = 100'000, int trials = 5) {
 
 int main(int argc, char** argv) {
     calibrateSpinCost();
-    int  iterations = (argc > 1) ? std::atoi(argv[1]) : 100'000;
+    int  iterations = (argc > 1) ? std::atoi(argv[1]) : 10'000'000;
     bool warm       = (argc > 2) ? (std::atoi(argv[2]) != 0) : true;
 
     generator gen;
@@ -646,8 +646,8 @@ int main(int argc, char** argv) {
     }
     
 
-    runDepthSweep(gen, iterations);
-    //runMixedFlow(gen, iterations);
+    //runDepthSweep(gen, iterations);
+    runMixedFlow(gen, iterations);
     /*for(int j = 1; j <= 5; ++j){
     int levels = std::pow(10, j);
 

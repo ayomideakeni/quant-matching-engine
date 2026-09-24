@@ -17,6 +17,8 @@ struct Stats {
     size_t batchMax = 0;
     size_t batchMin = SIZE_MAX;
     double totalNs = 0.0;
+    size_t cancelEntries = 0;
+    size_t bookEntries = 0;
 };
 
 Stats computeStats(const std::vector<BenchSample>&  original) {
@@ -31,6 +33,8 @@ Stats computeStats(const std::vector<BenchSample>&  original) {
         st.totalOps += s.ops;
         st.batchMin = std::min(st.batchMin, s.ops);
         st.batchMax = std::max(st.batchMax, s.ops);
+        st.cancelEntries += s.cancelEntries;
+        st.bookEntries += s.bookSize;
         
     }
     st.batches = samples.size();
@@ -117,6 +121,8 @@ void reportPercentiles(const std::string& label,
     std::print("  p99       : {:.3f} ns/op\n", st.p99);
     std::print("  p99.9     : {:.3f} ns/op\n", st.p999);
     std::print("  Max       : {:.3f} ns/op\n", st.max);
+    std::println("  Cancel Entries       : {}", st.cancelEntries);
+    std::println("  Book Entries       : {}", st.bookEntries);
     std::print("-----------------------------------------------------\n");
 }
 
@@ -642,8 +648,8 @@ struct idWindow{
 std::vector<Request> generateRequest(generator& gen, producer& prod, int iterations){
      std::uniform_int_distribution<int> sideDist(0, 1);
         std::uniform_int_distribution<int> typeDist(0, 9);
-        std::uniform_int_distribution<int> priceDist(1, 100);
-        std::uniform_int_distribution<int> quantityDist(1, 100);
+        std::uniform_int_distribution<int> priceDist(1, 1000);
+        std::uniform_int_distribution<int> quantityDist(1, 1000000);
         std::uniform_int_distribution<int> operationDist(0, 99);
         std::uniform_int_distribution<int> PriceChangeChance(0, 5);
         std::uniform_int_distribution<int> QuantityChangeChance(0, 5);
@@ -1851,7 +1857,7 @@ int main(){
     int drainCap = 1024;
     
         for (int i = 0; i < 5; ++i) {
-            generator gen;
+            generator gen(5, 90, 5);
             OrderBook book;
             t.concurrentBench(2, 800000, 64, 10000);
             //generator fragGen(45,10,45);
