@@ -728,12 +728,12 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
             double lockNs = 0.0;
             size_t cIndexSizeBefore = book.cIndexSize();
             size_t bookSizeBefore = book.totalBookSize();
-            auto start = std::chrono::steady_clock::now();
             
+            auto start = std::chrono::steady_clock::now();
 
             size_t n = queue.waitAndDrain(drained, btx->drainCap, &slept, &lockNs);
             if (n == 0) break;
-
+            
             for (auto& r : drained) {
                 processOne(r);
             }

@@ -1051,12 +1051,14 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
     
     OrderBook conBook;
     RingBuffer queue(buffSize);
+    std::vector<std::thread> threads;
+    threads.reserve(producerCount);
     auto start = std::chrono::steady_clock::now();
 
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
 
 
-    std::vector<std::thread> threads;
+    
     for(int i = 0; i < producerCount; ++i){
         threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]), std::ref(retryCounts[i]));
     }
