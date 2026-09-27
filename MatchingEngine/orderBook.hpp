@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <utility>
 #include <chrono>
+#include <cassert>
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "boost/container/flat_map.hpp"
 #include "absl/container/btree_map.h"
@@ -311,10 +312,11 @@ public:
         return volume;
     }
     
- 
+    bool getFills = true;
+
     std::optional<std::vector<Fill>> submit(Order& incoming){
         if(!validate(incoming)) return std::nullopt;
-        //std::vector<Fill> fills;
+        std::vector<Fill> fills;
         auto& oppositeSide = getMap(opposite(incoming.side));
             while (incoming.quantity > 0 && !oppositeSide.empty()) {
                auto resting = best(opposite(incoming.side));
@@ -335,7 +337,7 @@ public:
                     /*std::cout << "FILL: " << tradeQty << " @ " << resting->price 
                               << " (Aggressor ID: " << incoming.id 
                               << ", Resting ID: " << resting->id << ")\n";*/
-                    //fills.emplace_back(resting->price, tradeQty, incoming.id, resting->id);
+                    if(getFills)fills.emplace_back(resting->price, tradeQty, incoming.id, resting->id);
 
                     if (resting->quantity == 0) {
                         Id restingId = resting->id;
@@ -349,7 +351,7 @@ public:
         if (incoming.type == Type::Limit && incoming.quantity > 0) {
             rest(incoming);
         }
-        return std::nullopt;
+        return fills;
     }
 
     struct ExpectedLevel {
@@ -582,11 +584,13 @@ public:
     size_t waitAndDrain(std::vector<Request>& out, size_t maxItems, bool* didSleep = nullptr, double* lockNs = nullptr) {
         size_t drained = 0;
 
-        auto lockStart = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point lockStart;
+        if(lockNs) lockStart = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(m);
-        auto lockEnd = std::chrono::steady_clock::now();
+        
 
         if (lockNs) {
+            auto lockEnd = std::chrono::steady_clock::now();
             *lockNs = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count()
             );
@@ -617,7 +621,9 @@ public:
     }
 
     RingBuffer(size_t capacity)
-        : capacity(capacity), mask(capacity - 1), buffer(capacity) {}
+        : capacity(capacity), mask(capacity - 1), buffer(capacity) {
+            assert(capacity != 0 && (capacity & (capacity - 1)) == 0);
+        }
 };
 
 enum class vio {
@@ -663,7 +669,120 @@ bool volumeConserved(Quantity volBefore, Quantity volAfter, Quantity incomingQua
     }
 }
 
-void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr, BenchContext* btx = nullptr) {
+struct alignas(64) Slot{
+    std::atomic<int64_t> state{};
+    Request req;
+};
+struct LockFreeQueue{
+    int64_t capacity;
+    int64_t mask;
+    alignas(64) std::vector<Slot> slots;
+    alignas(64) int64_t head;
+    alignas(64) std::atomic<int64_t> tail;
+    alignas(64)std::atomic<bool> stopping = false;
+
+
+
+
+    LockFreeQueue(size_t c)
+    :capacity(c), mask(c - 1), head(0),tail(0), slots(c){
+        assert(c != 0 && (c & (c - 1)) == 0);
+
+        for(int i = 0; i < slots.size(); ++i){
+            slots[i].state = i;
+        }
+    }
+   
+      
+    bool push(const Request& r){
+        int64_t pos = tail.load(std::memory_order_relaxed);
+        
+        while(true){
+
+            Slot& slot = slots[pos & mask];
+            int64_t cState = slot.state.load(std::memory_order_acquire);
+
+            int64_t diff = cState - pos;
+
+            if(diff == 0) { //slot is free
+                if(tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed)){
+                    slot.req = r;
+                    slot.state.store(pos + 1, std::memory_order_release);
+                    return true;
+                }
+            }else if(diff < 0){ //slot holds data from previous lap
+                return false; //the queue is full
+            }else{
+                pos = tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+    std::optional<Request> pop(){
+        Slot& slot = slots[head & mask];
+
+        int64_t hState = slot.state.load(std::memory_order_acquire);
+
+        if(hState != head + 1){
+            return std::nullopt;
+        }
+        Request r = slot.req;
+        
+        slot.state.store(head + capacity, std::memory_order_release);
+        head++;
+        return r;
+    }
+    size_t waitAndDrain(std::vector<Request>& out, size_t maxItems, bool* didSleep = nullptr, double* lockNs = nullptr){
+        out.clear();
+
+        bool spun = false;
+
+        while(true){
+            int64_t wState = slots[head & mask].state.load(std::memory_order_acquire);
+
+            if(wState == head + 1)break;
+            else{
+                if(stopping.load(std::memory_order_acquire)){
+                    wState = slots[head & mask].state.load(std::memory_order_acquire);
+                    if(wState == head + 1) break;
+                    else return 0;
+                }else spun = true;
+            }
+            #if defined(__aarch64__)
+                __builtin_arm_yield();
+            #endif
+
+        }
+        
+        if(didSleep) *didSleep = spun;
+
+        size_t drained = 0;
+
+        while(drained < maxItems){
+            auto item = pop();
+
+            if(item.has_value()){
+                out.push_back(*item);
+                ++drained;
+            }else break;
+        }
+        return drained;
+    }
+    void shutdown(){
+        stopping.store(true, std::memory_order_release);
+    }
+};
+
+
+#ifdef USE_LOCKFREE
+using Queue = LockFreeQueue;
+#else
+using Queue = RingBuffer;
+#endif
+
+void writerLoop(Queue& queue, OrderBook& book, WriterContext* ctx = nullptr, BenchContext* btx = nullptr) {
+    #ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    #endif  
     std::vector<Request> drained;
 
     auto processOne = [&](Request& cRequest) -> void {
@@ -731,7 +850,7 @@ void writerLoop(RingBuffer& queue, OrderBook& book, WriterContext* ctx = nullptr
             
             auto start = std::chrono::steady_clock::now();
 
-            size_t n = queue.waitAndDrain(drained, btx->drainCap, &slept, &lockNs);
+            size_t n = queue.waitAndDrain(drained, btx->drainCap, &slept, nullptr);
             if (n == 0) break;
             
             for (auto& r : drained) {

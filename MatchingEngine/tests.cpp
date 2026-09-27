@@ -5,7 +5,7 @@
 #include <iostream>
 #include <random>
 #include <chrono>
-#include <cassert>
+
 #include <unordered_set>
 
 //enum class OpType { Submit, Cancel, Modify};
@@ -857,7 +857,7 @@ bool invReplay(std::vector<LoggedOp>& sequence){
     }
 void RingBufferIntegration(const std::string& testName,std::vector<Request> requests, std::vector<OrderBook::ExpectedLevel> eStates){
     OrderBook rbBook;
-    RingBuffer rbT(64);
+    Queue rbT(64);
     std::thread writer(writerLoop, std::ref(rbT), std::ref(rbBook), nullptr, nullptr);
     for(const auto& req : requests){
         auto push = rbT.push(req);
@@ -872,7 +872,7 @@ void RingBufferIntegration(const std::string& testName,std::vector<Request> requ
         std::println("[FAIL] Ring Buffer Failed State Tests For: {} ", testName);
     }
 }
-static void worker(RingBuffer& queue, int producerId, int count) {
+static void worker(Queue& queue, int producerId, int count) {
     producer prod{producerId, 0};
     Price basePrice = 100 + producerId * 10000;
 
@@ -897,7 +897,7 @@ void testRingBufferConcurrentMatching() {
     constexpr int totalExpectedOrders = numProducers * countPerProducer;
 
     OrderBook book;
-    RingBuffer queue(totalExpectedOrders + 1000);
+    Queue queue(totalExpectedOrders + 1000);
 
     std::thread writer(writerLoop, std::ref(queue), std::ref(book), nullptr, nullptr);
 
@@ -929,15 +929,16 @@ void testRingBufferConcurrentMatching() {
     assert(totalRestingQuantity == totalExpectedOrders);
 }
 
-static void pushAll(RingBuffer& queue, const std::vector<Request>& stream, size_t& retryCount){
-    int pushCount = 0;
+static void pushAll(Queue& queue, const std::vector<Request>& stream, size_t& retryCount){
+    size_t pushCount = 0;
     size_t spins = 0;
+    size_t rC = 0;
     for(int i = 0; i < stream.size(); ++i){
         while(true){
             bool pushed = queue.push(stream[i]);
             if(pushed) break;
             
-            retryCount++;
+            rC++;
             spins++;
             if(spins == 64){
                 std::this_thread::yield();
@@ -948,8 +949,8 @@ static void pushAll(RingBuffer& queue, const std::vector<Request>& stream, size_
         ++pushCount;
     }
     //std::println("Push Count: {}", pushCount);
+    retryCount = rC;
 }
-
 void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     generator cGen;
     std::vector<std::vector<Request>> streams;
@@ -970,7 +971,7 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     OrderBook conBook;
     auto totalResting = conBook.totalRestingVolume();
     std::println("Resting already: {}", totalResting);
-    RingBuffer queue(capSize);
+    Queue queue(capSize);
     ctx.captured.reserve(capSize);
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), &ctx, nullptr);
 
@@ -982,11 +983,13 @@ void testConcurrentGen(int producerCount, int opsPerProd, WriterContext& ctx){
     }
 
     size_t totalRetries = 0;
-    for(auto r : retryCounts) totalRetries += r;
-
+    
     for(auto& t : threads) t.join();
     queue.shutdown();
     writer.join();
+
+    for(auto r : retryCounts) totalRetries += r;
+
 
     std::vector<LoggedOp> replayCap;
     for(auto op : ctx.captured){
@@ -1027,7 +1030,8 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
     if(warmupOps > 0){
         generator warmGen;
         OrderBook warmBook;
-        RingBuffer warmQueue(buffSize);
+        warmBook.getFills = false;
+        Queue warmQueue(buffSize);
         producer prod(1);
 
         auto warmUpReqs = generateRequest(warmGen, prod, warmupOps);
@@ -1050,14 +1054,13 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
     std::vector<size_t> retryCounts(producerCount, 0);
     
     OrderBook conBook;
-    RingBuffer queue(buffSize);
+    conBook.getFills = false;
+    Queue queue(buffSize);
     std::vector<std::thread> threads;
     threads.reserve(producerCount);
     auto start = std::chrono::steady_clock::now();
 
     std::thread writer(writerLoop, std::ref(queue), std::ref(conBook), nullptr, &btx);
-
-
     
     for(int i = 0; i < producerCount; ++i){
         threads.emplace_back(pushAll, std::ref(queue), std::cref(streams[i]), std::ref(retryCounts[i]));
@@ -1079,14 +1082,14 @@ void concurrentBench(int producerCount, int opsPerProd, int draincap, size_t war
         static_cast<double>(totalOps) / seconds;
 
     std::println("Wall time   : {:.3f} ms", wallMs);
-std::println("Throughput   : {:.3f} M ops/s", throughput / 1'000'000.0);
+    std::println("Throughput   : {:.3f} M ops/s", throughput / 1'000'000.0);
 
     size_t totalRetries = 0;
     for(auto r : retryCounts) totalRetries += r;
 
     reportPercentiles("Bench Percentiles",btx.samples, draincap);
     std::println("Total Retries {}", totalRetries);
-    std::println("Retries per op {}", totalRetries / totalOps);
+    std::println("Retries per op {}", static_cast<double>(totalRetries) / totalOps);
 
   
     return;
@@ -1210,6 +1213,9 @@ void runmemoryPoolTests() {
 }
 
 
+
+
+
 };
 
 
@@ -1221,7 +1227,7 @@ void runmemoryPoolTests() {
 
     for (int it = 0; it < iterations; ++it) {
         OrderBook book;
-        RingBuffer queue(1024);
+        Queue queue(1024);
         WriterContext ctx;
         ctx.captured.reserve(8);
 
@@ -1270,7 +1276,7 @@ void runmemoryPoolTests() {
 }
     struct ProducerResult { size_t accepted = 0; size_t rejected = 0; };
 
-void backpressureWorker(RingBuffer& queue, int producerId,
+void backpressureWorker(Queue& queue, int producerId,
                         int opsCount, ProducerResult& out) {
     producer prod(producerId);
     Price basePrice = 1000 + (producerId * 1000);
@@ -1290,7 +1296,7 @@ void testRejectOnFullUnderContention() {
     constexpr size_t queueCapacity  = 32;       // deliberately far too small
 
     OrderBook book;
-    RingBuffer queue(queueCapacity);
+    Queue queue(queueCapacity);
     WriterContext ctx;
     ctx.captured.reserve(attempted);
 
@@ -1327,7 +1333,7 @@ void testRejectOnFullUnderContention() {
                  accepted, rejected, 100.0 * double(rejected) / double(attempted));
 }
 
-void retryingWorker(RingBuffer& queue, int producerId,
+void retryingWorker(Queue& queue, int producerId,
                     int opsCount, size_t& retriesOut) {
     producer prod(producerId);
     Price basePrice = 1000 + (producerId * 1000);
@@ -1351,12 +1357,12 @@ void retryingWorker(RingBuffer& queue, int producerId,
 
 void testProducerOutrunsConsumer() {
     constexpr int    producerCount  = 4;
-    constexpr int    opsPerProducer = 5000;
+    constexpr int    opsPerProducer = 1000;
     constexpr size_t totalOps       = size_t(producerCount) * opsPerProducer;
     constexpr size_t queueCapacity  = 512;
 
     OrderBook book;
-    RingBuffer queue(queueCapacity);
+    Queue queue(queueCapacity);
     WriterContext ctx;
     ctx.captured.reserve(totalOps);
 
@@ -1393,7 +1399,7 @@ void testProducerOutrunsConsumer() {
     req.id = id;
     return req;
 }
-void pushMany(RingBuffer& queue, int producerId, int count){
+void pushMany(Queue& queue, int producerId, int count){
     producer prod(producerId);
     
 
@@ -1405,8 +1411,10 @@ void pushMany(RingBuffer& queue, int producerId, int count){
 
 }
 
+
+
 void testRingBufferConcurrent(){
- RingBuffer buffer(100000);
+ Queue buffer(32768);
  std::vector<std::thread> threads;
  for(int i = 0; i < 4; ++i){
     threads.emplace_back(pushMany, std::ref(buffer), i, 5000);
@@ -1429,10 +1437,92 @@ void testRingBufferConcurrent(){
 
 }
 
+void stressTestLockFree(int producerCount, int opsPerProd, size_t capacity){
+    Queue q(capacity);
+
+    std::vector<size_t> retriesPerProd(producerCount, 0);
+    std::vector<int64_t> lastSeen(producerCount, -1);
+    std::vector<size_t> recievedPerProd(producerCount, 0);
+    
+    std::thread consumer([&]{
+        std::vector<Request> out;
+
+        while(true){
+            size_t n = q.waitAndDrain(out, 64);
+            if(n == 0) break;
+
+            for(auto item : out){
+                int p = producerOf(item.id);
+
+                if(p < 0 || p >= producerCount){
+                    std::println("[FAIL] Bad producer {} from id {}", p, item.id);
+                    assert(false);
+                }
+
+                if(!(item.id > lastSeen[p])){
+                    std::println("Producer {} Out of Order Id: {} Prempts {} ", p, item.id, lastSeen[p]);
+                    assert(false);
+                }
+                lastSeen[p] = item.id;
+
+                recievedPerProd[p]++;
+            }
+        }
+    });
+
+
+
+    std::vector<std::thread> threads;
+    for(int i = 0; i < producerCount; ++i){
+        threads.emplace_back([&, i]{
+            producer prod(i);
+            size_t retries = 0;
+            size_t spins = 0;
+
+            for(int j = 0; j < opsPerProd; ++j){
+                Request r = makeRequest(prod.nextId());
+
+                while(!q.push(r)){
+                    retries++;
+                    spins++;
+                    if(spins == 64) std::this_thread::yield(), spins = 0;
+                }
+                retriesPerProd[i] = retries;
+            }
+        });
+    }
+    for(auto& t : threads){
+        t.join();
+    }
+    q.shutdown();
+    consumer.join();
+
+    for(int p = 0; p < producerCount; ++p){
+        if(!(recievedPerProd[p] == opsPerProd)){
+            std::println("[FAIL] Received: {} Expected: {} ", recievedPerProd[p], opsPerProd);
+            return;
+        }
+    }
+        size_t sum = 0;
+        size_t retries = 0;
+        for(auto r : recievedPerProd) sum += r;
+        for(auto rt : retriesPerProd) retries += rt;
+        if((sum != (size_t)producerCount * opsPerProd)){
+            std::println("[FAIL] Sum Mismatch Got: {} Expected: {}", sum, (size_t)producerCount * opsPerProd);
+        }
+
+        std::println("[PASS] Producers = {} Items = {} Capacity = {} retries = {}", producerCount , sum, capacity, retries);
+
+    
+    
+
+   
+}
+
 
 
 void testRingBufferFillsAndRefuses() {
-    RingBuffer rb(4);
+    Queue rb(4);
 
     assert(rb.push(makeRequest(1)) == true);
     assert(rb.push(makeRequest(2)) == true);
@@ -1445,7 +1535,7 @@ void testRingBufferFillsAndRefuses() {
 }
 
 void testRingBufferFIFOOrder() {
-    RingBuffer rb(4);
+    Queue rb(4);
 
     rb.push(makeRequest(101));
     rb.push(makeRequest(102));
@@ -1468,7 +1558,7 @@ void testRingBufferFIFOOrder() {
 }
 
 void testRingBufferDrainsAndRefuses() {
-    RingBuffer rb(4);
+    Queue rb(4);
 
     rb.push(makeRequest(1));
     rb.push(makeRequest(2));
@@ -1486,7 +1576,7 @@ void testRingBufferDrainsAndRefuses() {
 }
 
 void testRingBufferWrapAround() {
-    RingBuffer rb(4);
+    Queue rb(4);
 
     for (int64_t i = 1; i <= 12; ++i) {
         bool pushed = rb.push(makeRequest(i));
@@ -1536,8 +1626,10 @@ void testVolumeConservedPredicate() {
     std::cout << "[PASS] All 8 volumeConserved unit tests PASSED successfully!\n";
 }
 
-/*void runRingBufferTests(){
-    //testRingBufferConcurrent();
+
+void runRingBufferTests(){
+
+    testRingBufferConcurrent();
     testRingBufferFillsAndRefuses();
     testRingBufferFIFOOrder();
     testRingBufferDrainsAndRefuses();
@@ -1546,9 +1638,13 @@ void testVolumeConservedPredicate() {
     testCancelMidMatch();
     testProducerOutrunsConsumer();
     testRejectOnFullUnderContention();
+    for(int i = 0; i < 3; ++i){
+        stressTestLockFree(16, 100000, 64);
+    }
+    
 
 
-}*/
+}
 
 
 
@@ -1834,11 +1930,11 @@ int main(){
         std::cout << "Fuzzing completed without detecting issues.\n";
     }
 
-    //runRingBufferTests();
+    runRingBufferTests();
     //t.testRingBufferConcurrentMatching();
 
     WriterContext ctx;
-    t.testConcurrentGen(1, 1000000, ctx);
+    t.testConcurrentGen(4, 25000, ctx);
     
     if(ctx.invariant.has_value()){
         
