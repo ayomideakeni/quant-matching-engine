@@ -10,15 +10,15 @@ A limit order book matching engine in C++23: price-time priority, a single-write
 
 Single-threaded: resting submit is **8.3 ns**, flat across every depth tested from 10 to 100,000 price levels.
 
-Concurrent — 2 producers × 800,000 ops, drain cap 64, queue capacity 4,096, `-O3 -flto`, Apple M4, five runs:
+Concurrent — 2 producers × 800,000 ops, drain cap 64, capacity 4,096, `-O3 -flto`, Apple M4, runs 2–5 of 5, back to back:
 
-| | range |
-|---|---|
-| p50 | 52.7–54.7 ns |
-| mean | 62.1–65.9 ns |
-| p99 | 173.8–196.0 ns |
-| p99.9 | 240.9–285.8 ns |
-| throughput | 15.1–16.0 M ops/s |
+| | mutex | lock-free |
+|---|---|---|
+| p50 | 50.8–54.0 ns | 39.0–51.3 ns |
+| mean | 59.7–62.2 ns | 40.9–50.9 ns |
+| p99 | 174.5–178.4 ns | 66.4–72.9 ns |
+| p99.9 | 242.8–253.9 ns | 77.8–88.2 ns |
+| throughput | 16.0–16.7 M ops/s | 19.4–24.2 M ops/s |
 
 All percentiles are **percentiles of batch means**, not individual operations (see *Measurement*).
 
@@ -69,6 +69,8 @@ A book of resting buy and sell orders. Incoming orders match against the opposit
 
 **Scaling.** Across instruments, not within one: each instrument gets its own book and writer.
 
+**Lock-free queue** (`-DUSE_LOCKFREE`; the mutex queue stays the default). Each slot has a `state` counter: `p` = free for position `p`, `p+1` = ready, `p+capacity` = free for the next lap. Producers claim a position with a CAS on `tail`; the single consumer owns `head`. The request is published with a release store of `state` and read after an acquire load; freeing the slot is the same pair in reverse. A counter rather than a flag, because a flag can't tell a free slot from one that's claimed but not yet written. A full queue is detected with two loads and no shared write, unlike the mutex, where even a rejected push takes the lock.
+
 ---
 
 ## Testing
@@ -77,6 +79,7 @@ A book of resting buy and sell orders. Incoming orders match against the opposit
 - **Property-based fuzzing:** 100,000 randomised operations checked against four invariants — no crossed book, no orphaned cancel-index entries, FIFO within each level, volume conservation — zero violations.
 - **Counterexample shrinker:** removes operations one at a time while the failure still reproduces. Validated on injected bugs: 34 → 20 operations single-threaded, 19 → 2 through the queue.
 - **Concurrent:** 1.6M operations across 1–16 producers with zero violations; determinism shown by replaying 1M captured operations single-threaded to an identical book, per order and in queue position.
+- **Lock-free stress:** 16 producers on 10 cores, 64-slot queue, concurrent consumer, 10 × 1.6M items. None lost, none duplicated, per-producer order kept.
 - **Sanitizers:** clean under ThreadSanitizer and AddressSanitizer, including deliberately raced tests. TSan catches data races on the paths it executes — the one bug class the invariant checks can't see.
 
 ---
@@ -106,6 +109,8 @@ The median rises because producers now stay alive and contend for the whole run;
 - *Price levels* → `absl::btree_map`, adopted. Resting submit flat at 8.3 ns to 100,000 levels, and the best concurrent figures above.
 - An early btree run looked like a 15× regression. A single-producer test ruled out allocator contention; the real cause was a build missing `-O3`.
 
+**Mutex vs lock-free.** The tail was lock acquisition: removing the lock cut p99 ~2.5× and p99.9 ~3×, and the mean fell with it. The regimes differ: every mutex drain was a full batch of 64, while lock-free batches average 25–49 because the writer keeps up. So lock-free per-op figures include idle spin time and are conservative.
+
 **Smaller changes.** Removing redundant atomics from the queue's indices (already protected by the mutex) cut p50 by ~3 ns. `alignas(64)` on `Order` showed no measurable change, below the instrument's resolution at this batch size. A 500,000-operation churn test showed no drift from free-list fragmentation.
 
 ---
@@ -114,7 +119,7 @@ The median rises because producers now stay alive and contend for the whole run;
 
 - `submit` ignores `rest`'s return value, so an order arriving at a full pool could drop its remainder. Never observed with the pool sized well above peak. `modify`'s cancel-and-resubmit can't hit this, because the cancel frees a slot first.
 - Self-crossing orders from the same participant are not prevented.
-- A lock-free queue was prototyped early but compared using the old, flawed instrument. On hold, not rejected.
+- Lock-free queue: a producer preempted between claiming and publishing a slot blocks the consumer at that slot. That's the cost of keeping one global arrival order.
 
 ## Out of scope
 
@@ -122,6 +127,5 @@ Risk checks, pricing, persistence, and multiple instruments per book.
 
 ## Future work
 
-- Re-run the lock-free comparison on the corrected instrument.
 - A writer-targeted wake instead of undirected `yield()`, to keep the tail benefit at high producer counts.
 - Per-producer response queues so producers learn why an order failed, not just that it did.

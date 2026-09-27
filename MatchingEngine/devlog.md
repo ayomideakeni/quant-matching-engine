@@ -18,14 +18,24 @@ Session-by-session record. Short on purpose: what was done, what it showed, what
 | Cancel index → `boost::unordered_flat_map` | ✅ adopted |
 | Price levels → `absl::btree_map` (`flat_map` rejected) | ✅ adopted |
 | `alignas(64)` on `Order` | ⏸ parked — below instrument resolution |
-| Lock-free queue | ⏸ on hold — compared on the old instrument |
+| Lock-free MPSC queue | ✅ built, gate green, measured (behind `USE_LOCKFREE`) |
 | Direct-indexed price levels + bitmask | ⬜ in progress (branch) |
 
-**Current:** 2 producers × 800k, cap 64, capacity 4,096 → p50 52.7–54.7 ns, p99.9 240.9–285.8 ns, 15–16M ops/s. Resting submit flat 8.3 ns to 100,000 levels.
+**Current:** 2 producers × 800k, cap 64, capacity 4,096 → mutex p50 50.8–54.0 ns, p99.9 242.8–253.9 ns, 16.0–16.7M ops/s. Lock-free p50 39–51 ns, p99.9 78–88 ns, 19–24M ops/s. Resting submit flat 8.3 ns to 100,000 levels.
 
 ---
 
 ## Sessions
+
+### Lock-free MPSC queue
+- Built a bounded MPSC ring behind `-DUSE_LOCKFREE` with the same interface as `RingBuffer`. Per-slot `state` counter, CAS on `tail`, consumer owns `head`. `state` uses acquire/release on both sides; the CAS is relaxed.
+- Counter rather than a flag: a flag can't tell a free slot from one that's claimed but not yet written.
+- Setup: fills made switchable, clock calls in `waitAndDrain` run only when asked for, retries kept per producer, QoS set.
+- The power-of-two assert caught a disabled test using capacity 100,000. That would have silently corrupted the mutex queue. Fixed, and `RingBuffer` now asserts it too.
+- Gate: replay, fuzz, queued fuzz (4 producers, 1M ops), determinism, stress test (16 producers on 10 cores, cap 64, 10 × 1.6M), TSan, ASan. All clean; every bug found was in test code.
+- Prediction: p99 ~75 ✅ (66–73), p99.9 ~125 ✅ (78–88), p50 flat ✅, mean flat ✗ (fell 18–34% with the tail), max ≤ 200 ✗ (single-sample OS noise).
+- Regime change: mutex batches were always 64, lock-free batches average 25–49. Retries collapsed and throughput rose 20–45%.
+- Lesson: predict percentiles, not the max. When the tail moves, the mean moves with it.
 
 ### README rewrite
 - Cut to about a third of its length. Kept every claim the CV relies on; removed the narration, the full bug write-ups, and per-decision rejection tables.
