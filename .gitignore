@@ -5,8 +5,7 @@ build/
 # Compiled binaries (no extension)
 main
 tests
-tests_asan
-tests_tsan
+tests_*
 testprofile
 benchmark
 throughput
@@ -19,3 +18,6 @@ orderBook
 # Run artefacts
 run_output.txt
 profile.txt
+*_out.txt
+out.txt
+*_profile.txt
