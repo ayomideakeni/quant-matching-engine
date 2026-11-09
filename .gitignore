@@ -5,6 +5,7 @@ build/
 # Compiled binaries (no extension)
 main
 tests
+!RiskEngine/tests
 tests_*
 testprofile
 benchmark
