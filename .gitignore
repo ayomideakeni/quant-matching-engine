@@ -21,3 +21,6 @@ profile.txt
 *_out.txt
 out.txt
 *_profile.txt
+
+# Python
+__pycache__/
