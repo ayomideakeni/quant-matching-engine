@@ -1,7 +1,5 @@
 # Matching Engine
 
-> This repository also contains **Challenge B — a pre-trade risk engine** in [`RiskEngine/`](RiskEngine/README.md). Build it with `./build.sh` and run it with `./run.sh --state-dir /absolute/path`; both root scripts delegate to `RiskEngine/`. The matching engine described below lives in [`MatchingEngine/`](MatchingEngine/).
-
 A limit order book matching engine in C++23: price-time priority, a single-writer concurrency layer, and a test suite built to show correctness rather than assume it.
 
 **Status:** feature-complete. Correct single-threaded and concurrent, clean under ThreadSanitizer and AddressSanitizer, benchmarked and profiled.

@@ -5,7 +5,6 @@ build/
 # Compiled binaries (no extension)
 main
 tests
-!RiskEngine/tests
 tests_*
 testprofile
 benchmark
@@ -22,6 +21,3 @@ profile.txt
 *_out.txt
 out.txt
 *_profile.txt
-
-# Python
-__pycache__/
