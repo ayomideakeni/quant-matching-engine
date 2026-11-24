@@ -2,7 +2,7 @@
 
 A limit order book matching engine in C++23: price-time priority, a single-writer concurrency layer, and a test suite built to show correctness rather than assume it.
 
-**Status:** feature-complete. Correct single-threaded and concurrent, clean under ThreadSanitizer and AddressSanitizer, benchmarked and profiled.
+**Status:** matching core complete, tested and benchmarked; clean under ThreadSanitizer and AddressSanitizer. Now being extended into a full simulated exchange with a sequenced binary market data feed ([spec](docs/feed_spec.md)), retransmission, snapshots and order entry. Open issues are listed under *Known limitations*.
 
 ---
 
@@ -117,7 +117,10 @@ The median rises because producers now stay alive and contend for the whole run;
 
 ## Known limitations
 
-- `submit` ignores `rest`'s return value, so an order arriving at a full pool could drop its remainder. Never observed with the pool sized well above peak. `modify`'s cancel-and-resubmit can't hit this, because the cancel frees a slot first.
+- `submit` ignores `rest`'s return value, so an order arriving at a full pool drops its remainder while `submit` still reports success. Never observed with the pool sized well above peak. `modify`'s cancel-and-resubmit can't hit this, because the cancel frees a slot first.
+- `modify` with a negative quantity and no price change writes the negative quantity into the resting order.
+- `modify` with a new price that fails validation (or a new quantity ≤ 0 alongside a price change) removes the order and still returns `true`.
+- `validate` has no upper bounds on price or quantity, so the engine accepts orders the market data feed cannot represent (caps: price 2,147,483,647 ticks, quantity 1,073,741,823).
 - Self-crossing orders from the same participant are not prevented.
 - Lock-free queue: a producer preempted between claiming and publishing a slot blocks the consumer at that slot. That's the cost of keeping one global arrival order.
 

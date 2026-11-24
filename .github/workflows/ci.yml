@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: tests (-O2)
+            flags: -O2
+          - name: tsan (mutex queue)
+            flags: -O1 -g -fsanitize=thread
+          - name: tsan (lock-free queue)
+            flags: -O1 -g -fsanitize=thread -DUSE_LOCKFREE
+          - name: asan
+            flags: -O1 -g -fsanitize=address
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Boost and Abseil
+        run: brew install boost abseil pkgconf
+
+      - name: Build
+        working-directory: MatchingEngine
+        run: |
+          clang++ -std=c++23 ${{ matrix.flags }} \
+            -I"$(brew --prefix boost)/include" \
+            tests.cpp $(pkg-config --cflags --libs absl_btree) \
+            -o tests
+
+      - name: Run
+        working-directory: MatchingEngine
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -o pipefail
+          ./tests 2>&1 | tee out.txt
+
+      - name: Check output
+        working-directory: MatchingEngine
+        run: |
+          if grep -E '\[FAIL\]|FAILED|VIOLATION|DETECTED|detected an issue' out.txt; then
+            echo "::error::a test reported a failure (lines above)"
+            exit 1
+          fi
+          if ! grep -q 'Passed Determinisim Test' out.txt; then
+            echo "::error::the correctness suite did not run; main() in tests.cpp is running something else"
+            exit 1
+          fi
+          echo "$(grep -c -E 'PASS|Passed' out.txt) passing checks"
