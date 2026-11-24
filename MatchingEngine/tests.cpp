@@ -7,6 +7,8 @@
 #include <chrono>
 
 #include <unordered_set>
+#include <print>
+#include <string_view>
 
 //enum class OpType { Submit, Cancel, Modify};
 struct Stats {
@@ -1651,10 +1653,19 @@ void runRingBufferTests(){
 #ifndef TESTS_NO_MAIN
 
 
-int main(){
+// ./tests        runs the correctness suite
+// ./tests bench  runs the concurrent benchmark
+int main(int argc, char** argv){
     Test t;
 
-    /*std::vector<Order> buyAggressorOrders {
+    if (argc > 1 && std::string_view(argv[1]) == "bench") {
+        for (int i = 0; i < 5; ++i) {
+            t.concurrentBench(2, 800000, 64, 10000);
+        }
+        return 0;
+    }
+
+    std::vector<Order> buyAggressorOrders {
         {Side::Sell, Type::Limit, 102, 100, 1, 0},
         {Side::Sell, Type::Limit, 103, 50, 2, 0},
         {Side::Buy, Type::Limit, 103, 90, 3, 0}
@@ -1950,21 +1961,7 @@ int main(){
     } else {
         std::cout << "Fuzzing completed without detecting issues.\n";
 
-    }*/
-
-    int drainCap = 1024;
-    
-        for (int i = 0; i < 5; ++i) {
-            generator gen(5, 90, 5);
-            OrderBook book;
-            t.concurrentBench(2, 800000, 64, 10000);
-            //generator fragGen(45,10,45);
-            //t.fragTest(book, fragGen, 500'000, 5000, 1000);
-        //t.generateAndExecute(book, gen, 400000);
-        }
-    
-    
-   
+    }
 
     //t.runmemoryPoolTests();
  
